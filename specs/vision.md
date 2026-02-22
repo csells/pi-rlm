@@ -84,6 +84,13 @@ LLM provider Pi supports.
    current reasoning step. Compaction doesn't need to be fought or replaced —
    it simply never triggers, because there's nothing to compact.
 
+   Critically, the model always knows what it has. The working context contains
+   a manifest of externalized objects — their identities, types, and sizes — so
+   the model can make informed decisions about what to explore. This mirrors the
+   paper's design, where the REPL environment describes its available variables
+   to the model. The manifest is what makes the model a competent strategist
+   rather than reaching blindly into a dark closet.
+
 2. **Any model, any provider.** Pi-RLM is not married to a specific LLM. It uses
    Pi's `pi-ai` abstraction for all model calls — root and recursive alike. If
    Pi supports it, Pi-RLM works with it. Different models can be routed to
@@ -108,6 +115,15 @@ LLM provider Pi supports.
    handled entirely beneath the surface. The user operates under an RLM blanket
    that is fully transparent when they want to look through it, and invisible
    when they don't.
+
+   The default experience is **zero footprint**. A fresh Pi session with Pi-RLM
+   installed feels identical to vanilla Pi. No widget visible, no new commands
+   in your face, no behavior change. The extension is completely silent until
+   context pressure causes it to activate — at which point the user's first
+   sign is simply the absence of degradation. Where vanilla Pi would compact
+   and the agent would start forgetting, Pi-RLM just keeps working. That
+   absence — the compaction that doesn't happen, the degradation that doesn't
+   arrive — is the extension proving its value.
 
    There is an inherent gap between what the user sees (the full conversation)
    and what the LLM has in its working context (a pruned, externalized view).
@@ -199,6 +215,29 @@ With Pi-RLM, the coding agent can:
   with better context management and recursive capabilities. The user experience
   is the same Pi TUI — just with a widget showing RLM state and tools that let
   the model think deeper.
+
+## Assumptions and Risks
+
+The architecture rests on one central assumption from the paper: **the model is
+a competent RLM strategist.** The system depends on the LLM knowing when to use
+RLM tools vs. normal Pi tools, writing effective decomposition strategies,
+producing focused recursive sub-queries, and synthesizing results from multiple
+children into coherent answers. The paper demonstrated that models can do this
+well in controlled experiments on specific task types. The challenge is
+generalizing from those experiments to the open-ended, interactive environment
+of a coding agent session.
+
+If the model is a poor strategist — over-recursing on simple questions,
+under-recursing on complex ones, choosing the wrong tool — the system degrades
+to a slower, more expensive version of normal Pi. The paper provides strong
+evidence that this works; the risk is in the generalization, not the mechanism.
+
+The model is as much a user of this system as the human is. The quality of the
+experience — for both — depends on how well the model understands its RLM
+environment: what's externalized, what tools are available, when to use them,
+and what they cost in latency and tokens. The paper solved this with carefully
+designed environment descriptions and prompts. **The model's understanding of
+its RLM environment is a first-class design concern**, not an afterthought.
 
 ## Success Criteria
 
