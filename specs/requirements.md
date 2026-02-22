@@ -15,11 +15,12 @@ Requirements are tagged **[MUST]**, **[SHOULD]**, or **[MAY]** per RFC 2119.
 **A-1: Pi's extension API is sufficient.** The design assumes Pi's public
 extension API supports: (a) intercepting and modifying LLM context via the
 `context` event, (b) cancelling or customizing compaction via
-`session_before_compact`, (c) making child LLM calls via `pi-ai` from extension
-code, (d) registering custom tools with TypeBox schemas, (e) rendering TUI
-widgets via `setWidget` and overlays via `ui.custom()`, and (f) persisting
-extension state via `appendEntry`. An early feasibility spike must validate
-these before detailed design. See [Risk R-4](#r-4-extension-api-surface).
+`session_before_compact`, (c) making child LLM calls via `pi-ai`'s exported
+`stream()` function (confirmed: `stream(model, context, options)` takes a
+`Model`, a `Context` with system prompt + messages + tools, and returns an
+`AssistantMessageEventStream`), (d) registering custom tools with TypeBox
+schemas, (e) rendering TUI widgets via `setWidget` and overlays via
+`ui.custom()`, and (f) persisting extension state via `appendEntry`.
 
 **A-2: Models are competent RLM strategists.** The architecture depends on the
 LLM knowing when to use RLM tools, writing effective decomposition strategies,
@@ -70,12 +71,17 @@ exceeds a configurable threshold (e.g., 60% of window). Provide manual
 override (`/rlm externalize`) for users who want direct control.
 
 <a id="r-4-extension-api-surface"></a>
-**R-4: Extension API surface.** If Pi's `context` event does not support deep
-enough message modification, or if `pi-ai` cannot be invoked for child calls
-from extension code, Principle 3 (pure extension) fails.
+**R-4: Extension API surface.** The critical capabilities have been confirmed
+in Pi's public API: the `context` event supports message array modification,
+`session_before_compact` supports cancellation, `pi-ai` exports `stream()` for
+direct in-process LLM calls, and `registerTool`/`setWidget`/`appendEntry` cover
+tools, UI, and persistence. The remaining risk is undocumented edge cases —
+e.g., whether `stream()` works correctly when called concurrently from parallel
+`rlm_batch` children.
 
-*Mitigation:* Feasibility spike before design commitment. If gaps are found,
-propose minimal Pi core changes as PRs rather than forking.
+*Mitigation:* Build a minimal proof-of-concept extension early in Phase 1 that
+exercises context modification, compaction cancellation, and a `stream()` child
+call from a tool handler.
 
 **R-5: Retrieval failure.** When the model retrieves the wrong externalized
 content, it may confabulate with false confidence — worse than compaction, where
@@ -212,9 +218,12 @@ for the model to retrieve more.
 a child call that runs in isolation with its own context, focused on a specific
 sub-query and data slice.
 
-**FR-5.2** [MUST] Child calls **must** use Pi's `pi-ai` abstraction for model
-invocation. They **must not** spawn new Pi processes (no `exec("pi", ...)`);
-they run in-process.
+**FR-5.2** [MUST] Child calls **must** use the `stream()` function exported by
+`@mariozechner/pi-ai` for direct, in-process LLM completion. The model is
+resolved via `ctx.modelRegistry`. No agent session, no process spawning, no
+lock files — just a function call with a system prompt, messages, and
+(optionally) tools. This is the same function Pi's own agent loop uses
+internally.
 
 **FR-5.3** [MUST] Each child call **must** have: a dedicated system prompt
 describing the RLM environment and available tools, the target data slice
