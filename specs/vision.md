@@ -122,14 +122,18 @@ LLM provider Pi supports.
    that is fully transparent when they want to look through it, and invisible
    when they don't.
 
-   The default experience is **zero footprint**. A fresh Pi session with Pi-RLM
-   installed feels identical to vanilla Pi. No widget visible, no new commands
-   in your face, no behavior change. The extension is completely silent until
-   context pressure causes it to activate — at which point the user's first
-   sign is simply the absence of degradation. Where vanilla Pi would compact
-   and the agent would start forgetting, Pi-RLM just keeps working. That
-   absence — the compaction that doesn't happen, the degradation that doesn't
-   arrive — is the extension proving its value.
+   RLM processing is **on by default**. The user can turn it off at any time
+   with `/rlm off` and back on with `/rlm on`. When on, the extension
+   manages context externalization automatically — the user doesn't need to
+   think about it. When off, Pi reverts to standard behavior with compaction.
+   This is a simple toggle, not a mode buried in configuration.
+
+   A persistent status widget is always visible, showing the current RLM state.
+   When off, the widget shows simply "RLM: off." When on but idle (no context
+   pressure yet), it shows "RLM: on" with basic stats. When actively
+   externalizing or processing recursive calls, it shows phase, depth, child
+   count, and token budget. The widget is the user's constant, at-a-glance
+   confirmation that RLM is working — or not.
 
    There is an inherent gap between what the user sees (the full conversation)
    and what the LLM has in its working context (a pruned, externalized view).
@@ -150,15 +154,12 @@ LLM provider Pi supports.
    addresses this dependency directly.
 
 5. **Full observability and full control.** The RLM blanket is transparent, not
-   opaque. Recursive sub-calls are not a black box. Observability is
-   **progressive**: by default, the user sees only RLM tool calls inline in the
-   chat — same as any other tool. A TUI widget showing RLM state (mode, phase,
-   recursion depth, token budget) appears only when RLM is actively processing
-   and hides when idle. For users who want more, an inspector overlay
-   visualizes the full call tree in real time, and every recursive invocation
-   is logged to a trajectory file for post-hoc debugging and auditing. The
-   depth of visibility matches the user's curiosity — from "just works" to
-   full X-ray.
+   opaque. Recursive sub-calls are not a black box. The persistent status
+   widget always shows the current RLM state — off, idle, or active with
+   details. RLM tool calls appear inline in the chat, same as any other tool.
+   For users who want deeper visibility, an inspector overlay visualizes the
+   full call tree in real time, and every recursive invocation is logged to a
+   trajectory file for post-hoc debugging and auditing.
 
    Beyond observability, the user has **control**. They can adjust recursion
    depth, switch the model used for sub-calls, set budget limits, and cancel a
@@ -175,9 +176,9 @@ LLM provider Pi supports.
    **Graceful degradation** is part of control. If the RLM gets stuck —
    over-recursing, retrieving wrong context, spiraling on a bad decomposition —
    the user can cancel mid-flight and fall back to vanilla Pi behavior. The
-   working context is never corrupted by a failed RLM operation. The extension
-   can also be disabled entirely mid-session, reverting to standard Pi with
-   compaction. The system fails safe.
+   working context is never corrupted by a failed RLM operation. `/rlm off`
+   disables the extension mid-session, reverting to standard Pi with
+   compaction; `/rlm on` re-enables it. The system fails safe.
 
 6. **Security is external.** Pi-RLM does not implement sandboxing, OS-level
    isolation, or code execution guardrails. Those concerns are handled by the
@@ -225,10 +226,6 @@ That's the small version. The large version:
   demonstrated Pareto-efficient economics: superior depth at a fraction of
   frontier-model pricing.
 
-- **Full auditability.** Every recursive call — its query, context slice, model,
-  result, token usage — is logged. You can replay and debug the agent's entire
-  reasoning process after the fact.
-
 ## What This Is Not
 
 - **Not a RAG system.** There is no embedding index, no vector similarity
@@ -244,51 +241,6 @@ That's the small version. The large version:
   it with context management and recursive capabilities. Everything runs
   in-process as a standard Pi extension — no forks, no standalone services, no
   external runtimes.
-
-## Assumptions and Risks
-
-**Risk 1: The generalization gap.** The MIT paper demonstrated RLMs on batch
-analytical tasks — processing large corpora, codebase understanding, research
-synthesis. These are tasks where you have a large blob of data and need to
-extract structured answers. A coding agent session is fundamentally different:
-interactive, stateful, incremental, and heterogeneous — a mix of user prompts,
-code, tool outputs, errors, and model reasoning. The paper provides strong
-evidence that the mechanism works; the risk is in generalizing from controlled
-experiments on specific task types to the open-ended, unpredictable environment
-of a real coding session. This is the central technical risk of the project.
-
-**Risk 2: Model competence as RLM strategist.** The architecture depends on the
-LLM knowing when to use RLM tools vs. normal Pi tools, writing effective
-decomposition strategies, producing focused recursive sub-queries, and
-synthesizing results from multiple children into coherent answers. If the model
-is a poor strategist — over-recursing on simple questions, under-recursing on
-complex ones, choosing the wrong tool — the system degrades to a slower, more
-expensive version of normal Pi. Not all models are equally capable RLM
-strategists; the extension may need to adapt its behavior based on model
-capability.
-
-**Risk 3: Externalization timing.** When does content move from working context
-to external store? Too early and short sessions pay a retrieval tax for content
-that would have fit in context. Too late and compaction fires before
-externalization kicks in, defeating the purpose. The heuristics for when to
-externalize are arguably the hardest design problem in the system, and getting
-them wrong in either direction degrades the experience.
-
-**Risk 4: Extension API surface.** The "pure Pi extension" constraint (Principle
-3) requires that Pi's extension API supports prompt interception, child LLM
-calls from extension code, and conversation history management. If any of these
-require core changes to Pi, the constraint fails. An early feasibility audit
-against Pi's actual API is essential before committing to detailed design.
-
-The model is as much a user of this system as the human is. The quality of the
-experience — for both — depends on how well the model understands its RLM
-environment: what's externalized, what tools are available, when to use them,
-and what they cost in latency and tokens. The paper solved this with carefully
-designed environment descriptions and prompts. **The model's understanding of
-its RLM environment is a first-class design concern**, not an afterthought.
-The design doc must specify the strategy for model education: what the
-environment description looks like, how the manifest is presented, and how
-the model learns the cost/benefit of RLM operations.
 
 ## Success Criteria
 
