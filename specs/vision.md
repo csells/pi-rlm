@@ -35,24 +35,37 @@ In late 2025, researchers at MIT CSAIL introduced Recursive Language Models
 > programmatically explore it.**
 
 Instead of feeding an LLM a 200K-token prompt and praying it finds what it
-needs, you store the data in an external environment and give the model tools to
-inspect, search, slice, and — critically — **recursively sub-query** over
-portions of it. The model writes a plan for how to process the data, executes it
-step by step, and only the compact results of each step flow back into the
-working context.
+needs, you store the data in an external environment and give the model
+**programmatic access** to it. The model doesn't just call tools — it writes
+*exploration strategies*: programs with loops, conditionals, and recursive
+sub-calls that inspect, search, slice, partition, and process the data. The
+model is the active strategist, deciding how to decompose the problem and what
+to examine. The environment provides the primitives; the model provides the
+intelligence.
 
 The key mechanism is **recursive self-invocation**: when a chunk of data is too
 large or complex for a single pass, the model spawns a child call — a fresh,
 isolated LLM invocation focused on just that chunk, with its own sub-query and
 bounded context. Children can spawn their own children. Results propagate upward
-as structured summaries, never as raw dumps. The parent model's working memory
+as structured outputs, never as raw dumps. The parent model's working memory
 stays clean.
 
-This is not RAG. It's not summarization. It's the model **actively decomposing
-and conquering** its own context, trading inference-time compute for analytical
-depth. MIT demonstrated this working reliably over 10M+ tokens — 100x the base
-context window — with quality that matches or exceeds frontier models running on
-the raw input.
+This is not RAG. There is no embedding index, no vector similarity search, no
+"find the most relevant chunks and hope the model connects the dots." The model
+programmatically explores the data using code, not statistical similarity. It is
+not summarization — nothing is discarded or lossy-compressed. It is the model
+**actively decomposing and conquering** its own context, trading inference-time
+compute for analytical depth.
+
+The results are striking. MIT demonstrated RLMs working reliably over 10M+
+tokens — **100x the base context window** — with quality that matches or exceeds
+frontier models processing the raw input in a single pass. RLMs outperformed
+both vanilla long-context models and conventional scaffolds (summarization, RAG,
+retrieval agents) on dense reasoning tasks including deep research, codebase
+understanding, and long-horizon analysis. The economics are favorable too: by
+routing recursive sub-calls to cheaper, faster models, RLMs achieve superior
+depth at a fraction of the cost of processing massive prompts through a frontier
+model.
 
 ## The Vision
 
@@ -63,11 +76,13 @@ LLM provider Pi supports.
 
 ### Core Principles
 
-1. **Zero compaction.** The Pi agent's active context stays small — always.
-   Large content is externalized to an extension-owned store the moment it
-   enters the system. The LLM sees compact references and uses RLM tools to
-   access the underlying data on demand. Pi's built-in compaction is intercepted
-   and replaced.
+1. **Compaction is irrelevant.** The Pi agent's context window becomes a
+   workspace for active reasoning, not a warehouse for accumulated history.
+   Large content is externalized to an extension-owned store, and the LLM has
+   programmatic access to all of it on demand via RLM tools. The working context
+   stays naturally small because the model only pulls in what it needs for the
+   current reasoning step. Compaction doesn't need to be fought or replaced —
+   it simply never triggers, because there's nothing to compact.
 
 2. **Any model, any provider.** Pi-RLM is not married to a specific LLM. It uses
    Pi's `pi-ai` abstraction for all model calls — root and recursive alike. If
@@ -94,13 +109,30 @@ LLM provider Pi supports.
    that is fully transparent when they want to look through it, and invisible
    when they don't.
 
-5. **Full observability.** The RLM blanket is transparent, not opaque.
-   Recursive sub-calls are not a black box. A persistent TUI widget shows the
-   current RLM state: mode, phase, recursion depth, token budget, active query.
-   An inspector overlay visualizes the call tree in real time. Every recursive
-   invocation is logged to a trajectory file for debugging and auditing. The
-   user can always see *why* the agent is doing what it's doing — but they
-   never *have* to.
+   There is an inherent gap between what the user sees (the full conversation)
+   and what the LLM has in its working context (a pruned, externalized view).
+   The RLM tools are the bridge. When the user references something that has
+   been externalized — "remember that bug you found in auth.ts?" — the agent
+   uses the same RLM tools it uses for everything else to recover the relevant
+   context on demand. The user may occasionally see an `rlm_search` or
+   `rlm_peek` call fire before the agent responds to a follow-up question.
+   That's not a glitch — it's the agent remembering, visibly, using the same
+   mechanism that powers everything else. The system is self-healing by design.
+
+5. **Full observability and full control.** The RLM blanket is transparent, not
+   opaque. Recursive sub-calls are not a black box. A persistent TUI widget
+   shows the current RLM state: mode, phase, recursion depth, token budget,
+   active query. An inspector overlay visualizes the call tree in real time.
+   Every recursive invocation is logged to a trajectory file for debugging and
+   auditing. The user can always see *why* the agent is doing what it's doing —
+   but they never *have* to.
+
+   Beyond observability, the user has **control**. They can adjust recursion
+   depth, switch the model used for sub-calls, set budget limits, and cancel a
+   recursive decomposition mid-flight. These are the same parameters the MIT
+   paper used in its experiments (depth, model routing, budget), surfaced as
+   user-facing controls rather than hidden configuration. The user can steer
+   the RLM as precisely or as loosely as they want.
 
 6. **Security is external.** Pi-RLM does not implement sandboxing, OS-level
    isolation, or code execution guardrails. Those concerns are handled by the
@@ -113,28 +145,36 @@ LLM provider Pi supports.
 With Pi-RLM, the coding agent can:
 
 - **Run indefinitely without degradation.** Sessions can last hours or days.
-  Context is externalized continuously; the working window never bloats. There
-  is no compaction cliff.
+  The working context stays naturally small; there is no compaction cliff.
+  The paper demonstrated reliable operation over 10M+ tokens — there is no
+  inherent limit to session length.
 
-- **Operate on entire codebases.** "Audit all 500 files in src/ for race
-  conditions" becomes a tractable operation: the extension chunks the codebase,
-  dispatches parallel recursive queries to a fast sub-model, collects structured
-  findings, and synthesizes a report — all while the root context stays under
-  10K tokens.
+- **Operate on entire codebases.** The paper showed RLMs outperforming both
+  vanilla long-context models and conventional scaffolds on codebase
+  understanding and dense reasoning tasks. "Audit all 500 files in src/ for
+  race conditions" becomes a tractable operation: the model writes a
+  decomposition strategy, dispatches parallel recursive queries to a fast
+  sub-model, and synthesizes findings — all while the root context stays small.
 
 - **Maintain perfect recall.** Nothing is summarized away. Every file read,
   every tool output, every intermediate result is preserved in the external
   store and accessible via RLM tools. The model can always go back and look at
-  the raw data.
+  the raw data — and so can the user.
 
-- **Control costs.** Recursive sub-calls can be routed to cheaper, faster
-  models. A strong root model plans the work; lightweight children execute it.
-  Parallelism reduces wall-clock time. Budget limits prevent runaway spend.
+- **Trade latency for depth.** RLM operations involve multiple LLM calls and
+  take longer than a single-pass response. This is an explicit, deliberate
+  trade-off — the same one the paper makes. The payoff is that these operations
+  *work* on tasks that single-pass calls cannot handle, and they maintain
+  quality that degrades under conventional approaches. Recursive sub-calls can
+  be routed to cheaper, faster models and parallelized to control both cost and
+  wall-clock time. The paper demonstrated Pareto-efficient economics: superior
+  depth at a fraction of the cost of processing massive prompts through a
+  frontier model.
 
 - **Stay fully auditable.** Every recursive call — its query, its context slice,
-  its model, its result, its token usage — is logged to a JSONL trajectory file.
-  You can replay, inspect, and debug the agent's entire reasoning process after
-  the fact.
+  its model, its result, its token usage — is logged to a trajectory file. You
+  can replay, inspect, and debug the agent's entire reasoning process after the
+  fact.
 
 ## What This Is Not
 
@@ -149,6 +189,12 @@ With Pi-RLM, the coding agent can:
   access controls are the responsibility of the host environment, not this
   extension.
 
+- **Not a RAG system.** There is no embedding index, no vector similarity
+  search, no retrieval pipeline. The model programmatically explores externalized
+  data using the RLM paper's mechanisms — not statistical similarity. The paper
+  explicitly benchmarks against RAG-style approaches and demonstrates superior
+  results on the target task class.
+
 - **Not a replacement for Pi's agent.** Pi remains the agent. Pi-RLM augments it
   with better context management and recursive capabilities. The user experience
   is the same Pi TUI — just with a widget showing RLM state and tools that let
@@ -160,19 +206,27 @@ Pi-RLM succeeds when:
 
 1. A Pi session can run for **an arbitrarily long time** without triggering
    compaction and without degradation in the agent's recall or reasoning
-   quality.
+   quality — matching the paper's demonstrated reliability over 10M+ tokens.
 
 2. The agent can perform **whole-codebase operations** (audits, migrations,
    cross-cutting refactors) that would be impossible in a single context window,
-   with results that are accurate and complete.
+   with results that match or exceed what a frontier model achieves on raw
+   input — consistent with the paper's benchmarks against vanilla long-context
+   models.
 
-3. The extension works with **every LLM provider** Pi supports, with no
-   provider-specific code paths.
+3. The user experiences **seamless infinite context**: they see the full
+   conversation, the agent can recover any externalized information on demand,
+   and RLM operations appear as natural tool calls in the normal flow.
 
-4. A developer can **see what the agent is doing** at every level of recursion,
-   in real time, without leaving the Pi TUI.
+4. The user has **full observability and full control**: they can see the
+   recursive call tree, adjust depth and budget and model routing, and cancel
+   operations — at any time, without leaving the Pi TUI.
 
-5. The extension installs and works **without any changes to Pi's core** — today
+5. The extension works with **every LLM provider** Pi supports, with model
+   routing between root and recursive calls as demonstrated in the paper's
+   experiments.
+
+6. The extension installs and works **without any changes to Pi's core** — today
    and through future Pi updates.
 
 ## References
