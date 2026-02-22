@@ -26,6 +26,12 @@ not *the right* content for a specific reasoning step. They can't decompose a
 task, process a thousand files systematically, and synthesize results — they can
 only fetch snippets and hope the model connects the dots.
 
+This isn't a niche problem. Any developer who runs complex, long-horizon coding
+agent sessions — multi-file refactors, codebase audits, deep debugging — sees
+auto-compaction fire routinely. For these users, compaction isn't an edge case.
+It's the normal state of every working session, and the information loss
+accumulates with every trigger.
+
 ## The Insight
 
 In late 2025, researchers at MIT CSAIL introduced Recursive Language Models
@@ -135,13 +141,24 @@ LLM provider Pi supports.
    That's not a glitch — it's the agent remembering, visibly, using the same
    mechanism that powers everything else. The system is self-healing by design.
 
+   This recovery can fail. The agent might retrieve the wrong chunk, or miss
+   the relevant context entirely. This is a real risk, and in some ways worse
+   than compaction — with compaction, the model knows it lost information; with
+   a bad retrieval, it might not. The manifest mitigates this by giving the
+   model a structural map of what exists, but retrieval quality depends on the
+   model's skill as an RLM strategist. The "Assumptions and Risks" section
+   addresses this dependency directly.
+
 5. **Full observability and full control.** The RLM blanket is transparent, not
-   opaque. Recursive sub-calls are not a black box. A persistent TUI widget
-   shows the current RLM state: mode, phase, recursion depth, token budget,
-   active query. An inspector overlay visualizes the call tree in real time.
-   Every recursive invocation is logged to a trajectory file for debugging and
-   auditing. The user can always see *why* the agent is doing what it's doing —
-   but they never *have* to.
+   opaque. Recursive sub-calls are not a black box. Observability is
+   **progressive**: by default, the user sees only RLM tool calls inline in the
+   chat — same as any other tool. A TUI widget showing RLM state (mode, phase,
+   recursion depth, token budget) appears only when RLM is actively processing
+   and hides when idle. For users who want more, an inspector overlay
+   visualizes the full call tree in real time, and every recursive invocation
+   is logged to a trajectory file for post-hoc debugging and auditing. The
+   depth of visibility matches the user's curiosity — from "just works" to
+   full X-ray.
 
    Beyond observability, the user has **control**. They can adjust recursion
    depth, switch the model used for sub-calls, set budget limits, and cancel a
@@ -149,6 +166,18 @@ LLM provider Pi supports.
    paper used in its experiments (depth, model routing, budget), surfaced as
    user-facing controls rather than hidden configuration. The user can steer
    the RLM as precisely or as loosely as they want.
+
+   **Cost visibility** is part of control. Recursive operations involve multiple
+   LLM calls, and users paying their own API bills need to see what an
+   operation will cost before it runs. Estimated token usage and cost should be
+   surfaced before expensive operations, not discovered after the fact.
+
+   **Graceful degradation** is part of control. If the RLM gets stuck —
+   over-recursing, retrieving wrong context, spiraling on a bad decomposition —
+   the user can cancel mid-flight and fall back to vanilla Pi behavior. The
+   working context is never corrupted by a failed RLM operation. The extension
+   can also be disabled entirely mid-session, reverting to standard Pi with
+   compaction. The system fails safe.
 
 6. **Security is external.** Pi-RLM does not implement sandboxing, OS-level
    isolation, or code execution guardrails. Those concerns are handled by the
@@ -158,79 +187,98 @@ LLM provider Pi supports.
 
 ## What This Enables
 
-With Pi-RLM, the coding agent can:
+Consider a concrete scenario. You're two hours into debugging a distributed
+system failure. You've read stack traces from four services, examined config
+files, traced request flows, and narrowed the root cause to a race condition
+between two microservices. You ask: "What was the error code from the auth
+service?" With vanilla Pi, auto-compaction fired an hour ago. The stack traces
+from the first two services are gone — summarized into "investigated auth and
+gateway services." The agent says it doesn't have that information. You re-read
+the file manually, re-explain the context, and lose ten minutes.
 
-- **Run indefinitely without degradation.** Sessions can last hours or days.
-  The working context stays naturally small; there is no compaction cliff.
-  The paper demonstrated reliable operation over 10M+ tokens — there is no
-  inherent limit to session length.
+With Pi-RLM, the agent fires an `rlm_search`, finds the exact stack trace in
+the external store, and answers in seconds. You never broke stride.
 
-- **Operate on entire codebases.** The paper showed RLMs outperforming both
-  vanilla long-context models and conventional scaffolds on codebase
-  understanding and dense reasoning tasks. "Audit all 500 files in src/ for
-  race conditions" becomes a tractable operation: the model writes a
-  decomposition strategy, dispatches parallel recursive queries to a fast
-  sub-model, and synthesizes findings — all while the root context stays small.
+That's the small version. The large version:
 
-- **Maintain perfect recall.** Nothing is summarized away. Every file read,
-  every tool output, every intermediate result is preserved in the external
-  store and accessible via RLM tools. The model can always go back and look at
-  the raw data — and so can the user.
+- **Whole-codebase operations.** "Audit all 500 files in src/ for race
+  conditions" becomes tractable. The model writes a decomposition strategy,
+  dispatches recursive queries to a fast sub-model, and synthesizes findings.
+  The paper demonstrated RLMs outperforming both vanilla long-context models
+  and conventional scaffolds on exactly these tasks.
 
-- **Trade latency for depth.** RLM operations involve multiple LLM calls and
-  take longer than a single-pass response. This is an explicit, deliberate
-  trade-off — the same one the paper makes. The payoff is that these operations
-  *work* on tasks that single-pass calls cannot handle, and they maintain
-  quality that degrades under conventional approaches. Recursive sub-calls can
-  be routed to cheaper, faster models and parallelized to control both cost and
-  wall-clock time. The paper demonstrated Pareto-efficient economics: superior
-  depth at a fraction of the cost of processing massive prompts through a
-  frontier model.
+- **Sessions that never degrade.** Auto-compaction never fires. The working
+  context stays naturally small — not because information was discarded, but
+  because it was externalized and remains accessible. The paper demonstrated
+  reliable operation over 10M+ tokens.
 
-- **Stay fully auditable.** Every recursive call — its query, its context slice,
-  its model, its result, its token usage — is logged to a trajectory file. You
-  can replay, inspect, and debug the agent's entire reasoning process after the
-  fact.
+- **Session resume with full context.** Because the external store persists,
+  closing Pi and reopening tomorrow doesn't mean starting over. The agent can
+  recover full context from the store — not a compacted summary of yesterday's
+  session, but the actual data. Every session picks up where the last one left
+  off.
+
+- **Latency-for-depth trade-off.** RLM operations involve multiple LLM calls
+  and take longer than a single-pass response. The payoff: they *work* on tasks
+  that single-pass calls cannot handle. Recursive sub-calls route to cheaper,
+  faster models and parallelize to control cost and wall-clock time. The paper
+  demonstrated Pareto-efficient economics: superior depth at a fraction of
+  frontier-model pricing.
+
+- **Full auditability.** Every recursive call — its query, context slice, model,
+  result, token usage — is logged. You can replay and debug the agent's entire
+  reasoning process after the fact.
 
 ## What This Is Not
 
-- **Not a fork of Pi.** Pi-RLM is a standard extension. It does not modify Pi's
-  core agent loop, session format, or built-in tools.
-
-- **Not a standalone service.** There is no separate process, no MCP server, no
-  Python runtime. Everything runs in-process in Pi's Node.js/TypeScript
-  environment.
-
-- **Not a sandbox.** Code execution safety, file system isolation, and network
-  access controls are the responsibility of the host environment, not this
-  extension.
-
 - **Not a RAG system.** There is no embedding index, no vector similarity
-  search, no retrieval pipeline. The model programmatically explores externalized
-  data using the RLM paper's mechanisms — not statistical similarity. The paper
-  explicitly benchmarks against RAG-style approaches and demonstrates superior
-  results on the target task class.
+  search, no retrieval pipeline. The model programmatically explores
+  externalized data using the RLM paper's mechanisms — code, not statistical
+  similarity. The paper benchmarks against RAG-style approaches and
+  demonstrates superior results. This also means Pi-RLM is not a structured
+  retrieval or conversation indexing system — it uses the model's own
+  decomposition intelligence, not pre-built query patterns over a conversation
+  graph.
 
-- **Not a replacement for Pi's agent.** Pi remains the agent. Pi-RLM augments it
-  with better context management and recursive capabilities. The user experience
-  is the same Pi TUI — just with a widget showing RLM state and tools that let
-  the model think deeper.
+- **Not a replacement for Pi's agent.** Pi remains the agent. Pi-RLM augments
+  it with context management and recursive capabilities. Everything runs
+  in-process as a standard Pi extension — no forks, no standalone services, no
+  external runtimes.
 
 ## Assumptions and Risks
 
-The architecture rests on one central assumption from the paper: **the model is
-a competent RLM strategist.** The system depends on the LLM knowing when to use
-RLM tools vs. normal Pi tools, writing effective decomposition strategies,
-producing focused recursive sub-queries, and synthesizing results from multiple
-children into coherent answers. The paper demonstrated that models can do this
-well in controlled experiments on specific task types. The challenge is
-generalizing from those experiments to the open-ended, interactive environment
-of a coding agent session.
+**Risk 1: The generalization gap.** The MIT paper demonstrated RLMs on batch
+analytical tasks — processing large corpora, codebase understanding, research
+synthesis. These are tasks where you have a large blob of data and need to
+extract structured answers. A coding agent session is fundamentally different:
+interactive, stateful, incremental, and heterogeneous — a mix of user prompts,
+code, tool outputs, errors, and model reasoning. The paper provides strong
+evidence that the mechanism works; the risk is in generalizing from controlled
+experiments on specific task types to the open-ended, unpredictable environment
+of a real coding session. This is the central technical risk of the project.
 
-If the model is a poor strategist — over-recursing on simple questions,
-under-recursing on complex ones, choosing the wrong tool — the system degrades
-to a slower, more expensive version of normal Pi. The paper provides strong
-evidence that this works; the risk is in the generalization, not the mechanism.
+**Risk 2: Model competence as RLM strategist.** The architecture depends on the
+LLM knowing when to use RLM tools vs. normal Pi tools, writing effective
+decomposition strategies, producing focused recursive sub-queries, and
+synthesizing results from multiple children into coherent answers. If the model
+is a poor strategist — over-recursing on simple questions, under-recursing on
+complex ones, choosing the wrong tool — the system degrades to a slower, more
+expensive version of normal Pi. Not all models are equally capable RLM
+strategists; the extension may need to adapt its behavior based on model
+capability.
+
+**Risk 3: Externalization timing.** When does content move from working context
+to external store? Too early and short sessions pay a retrieval tax for content
+that would have fit in context. Too late and compaction fires before
+externalization kicks in, defeating the purpose. The heuristics for when to
+externalize are arguably the hardest design problem in the system, and getting
+them wrong in either direction degrades the experience.
+
+**Risk 4: Extension API surface.** The "pure Pi extension" constraint (Principle
+3) requires that Pi's extension API supports prompt interception, child LLM
+calls from extension code, and conversation history management. If any of these
+require core changes to Pi, the constraint fails. An early feasibility audit
+against Pi's actual API is essential before committing to detailed design.
 
 The model is as much a user of this system as the human is. The quality of the
 experience — for both — depends on how well the model understands its RLM
@@ -238,6 +286,9 @@ environment: what's externalized, what tools are available, when to use them,
 and what they cost in latency and tokens. The paper solved this with carefully
 designed environment descriptions and prompts. **The model's understanding of
 its RLM environment is a first-class design concern**, not an afterthought.
+The design doc must specify the strategy for model education: what the
+environment description looks like, how the manifest is presented, and how
+the model learns the cost/benefit of RLM operations.
 
 ## Success Criteria
 
