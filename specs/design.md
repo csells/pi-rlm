@@ -682,7 +682,7 @@ async function onContext(event: any, ctx: ExtensionContext) {
   // ContextUsage.tokens can be null (e.g., right after compaction, before
   // next LLM response). Skip externalization if tokens is unknown.
   const usage = ctx.getContextUsage();
-  if (usage && usage.tokens !== null) {
+  if (usage && usage.tokens !== null && ctx.model) {
     const model = ctx.model;
     const windowSize = usage.contextWindow;
     const threshold = windowSize * (state.config.tokenBudgetPercent / 100);
@@ -716,6 +716,7 @@ async function onContext(event: any, ctx: ExtensionContext) {
     messages.unshift({
       role: "user",
       content: [{ type: "text", text: manifest }],
+      timestamp: 0,  // Synthetic message — timestamp 0 sorts before all real messages
     });
   }
 
@@ -948,17 +949,31 @@ function resolveChildModel(
   modelOverride: string | undefined,
   config: RlmConfig,
   ctx: ExtensionContext,
-): Model {
+): Model | null {
   const modelStr = modelOverride ?? config.childModel;
   if (modelStr) {
     const [provider, ...idParts] = modelStr.split("/");
     const id = idParts.join("/");
     const found = ctx.modelRegistry.find(provider, id);
     if (found) return found;
-    // Fall back to root model if override not found
-    console.warn(`[pi-rlm] Child model "${modelStr}" not found, using root model`);
+    console.warn(`[pi-rlm] Child model "${modelStr}" not found, falling back to root model`);
   }
-  return ctx.model;  // Same as root
+  // ctx.model can be undefined (e.g., no model selected yet)
+  if (!ctx.model) {
+    console.error("[pi-rlm] No model available for child call");
+    return null;
+  }
+  return ctx.model;
+}
+```
+
+Callers of `resolveChildModel()` **must** check for `null` and return an error
+`ChildCallResult` if no model is available:
+
+```typescript
+const childModel = resolveChildModel(params.model, state.config, ctx);
+if (!childModel) {
+  return { content: [{ type: "text", text: "Error: No model available for recursive call. Select a model first." }], isError: true };
 }
 ```
 
@@ -978,8 +993,8 @@ RecursiveEngine.query(instructions, targetIds, parentId, depth, operationId, sig
   7. Build child context:
      systemPrompt = buildChildSystemPrompt(instructions, depth, config)
      targetContent = targetIds.map(id => store.get(id).content).join("\n---\n")
-     messages = [
-       { role: "user", content: [{ type: "text", text: targetContent }] }
+     messages: Message[] = [
+       { role: "user", content: [{ type: "text", text: targetContent }], timestamp: Date.now() }
      ]
 
      // If depth < maxDepth, give child access to rlm_peek, rlm_search, rlm_query
@@ -1106,43 +1121,61 @@ async function runChildAgentLoop(
   let turns = 0;
 
   while (turns < maxTurns) {
-    const response = await complete(model, {
+    // complete() returns AssistantMessage — content is (TextContent | ThinkingContent | ToolCall)[]
+    const response: AssistantMessage = await complete(model, {
       systemPrompt: context.systemPrompt,
       messages,
       tools: context.tools,
     }, { signal, maxTokens });
 
+    // Parse the content array — AssistantMessage has no .text or .toolCalls properties
+    const textParts = response.content.filter(c => c.type === "text") as TextContent[];
+    const toolCalls = response.content.filter(c => c.type === "toolCall") as ToolCall[];
+
     // If no tool calls, return the text response
-    if (!response.toolCalls || response.toolCalls.length === 0) {
-      return response.text;
+    if (toolCalls.length === 0) {
+      return textParts.map(c => c.text).join("");
     }
 
     // Execute tool calls and append results
-    messages.push({ role: "assistant", content: response.content });
-    for (const toolCall of response.toolCalls) {
+    // Push the full AssistantMessage (complete() returns all required fields)
+    messages.push(response);
+    for (const toolCall of toolCalls) {
       const handler = toolHandlers.get(toolCall.name);
       if (handler) {
-        const result = await handler(toolCall.input);
+        const result = await handler(toolCall.arguments);  // ToolCall.arguments, not .input
         messages.push({
           role: "toolResult",
           toolCallId: toolCall.id,
+          toolName: toolCall.name,           // Required by ToolResultMessage
           content: [{ type: "text", text: result }],
-        });
+          isError: false,                    // Required by ToolResultMessage
+          timestamp: Date.now(),             // Required by ToolResultMessage
+        } satisfies ToolResultMessage);
       }
     }
     turns++;
   }
 
-  // Max turns reached — return whatever we have
-  return messages[messages.length - 1]?.content?.[0]?.text ?? "Max turns reached";
+  // Max turns reached — extract text from last assistant message
+  const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
+  if (lastAssistant) {
+    const text = lastAssistant.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("");
+    if (text) return text;
+  }
+  return "Max turns reached";
 }
 ```
 
-**Note on `complete()` vs `stream()`:** The design uses `complete()` from
-`pi-ai`. If `complete()` is unavailable or returns differently than expected,
-the fallback is to use `stream()` and collect the full response by consuming
-the `AssistantMessageEventStream` to completion. The child agent loop handles
-tool calls regardless of which function is used.
+**Note on `complete()` return type:** `complete()` returns `AssistantMessage`
+whose `content` is `(TextContent | ThinkingContent | ToolCall)[]`. There are
+no `.text` or `.toolCalls` convenience properties — you must filter the
+content array by `type`. `ToolCall.arguments` (not `.input`) contains the
+parsed parameters. `ToolResultMessage` requires `toolName`, `isError`, and
+`timestamp` fields in addition to `toolCallId` and `content`.
 
 ### 6.6 Rate Limit Retry (FR-5.11)
 
@@ -1587,6 +1620,9 @@ pi.registerTool({
     updateWidget(ctx);
 
     try {
+      // resolveGlobs: expand glob patterns relative to cwd, return absolute paths.
+      // Uses Node's built-in fs.glob() (Node 22+) or a simple readdir+minimatch fallback.
+      // Skips: node_modules, .git, binary files (detected via null-byte check on first 512 bytes).
       const resolvedPaths = await resolveGlobs(params.paths, ctx.cwd);
       const objectIds: string[] = [];
 
@@ -1627,6 +1663,39 @@ pi.registerTool({
     }
   },
 });
+```
+
+### 7.5.1 `resolveGlobs` Helper
+
+```typescript
+import { glob } from "node:fs/promises";  // Node 22+
+
+const DEFAULT_IGNORES = ["**/node_modules/**", "**/.git/**"];
+
+async function resolveGlobs(
+  patterns: string[],
+  cwd: string,
+): Promise<string[]> {
+  const results: string[] = [];
+  for (const pattern of patterns) {
+    // Node 22+ fs.glob supports glob patterns natively
+    for await (const entry of glob(pattern, { cwd, exclude: DEFAULT_IGNORES })) {
+      const abs = path.resolve(cwd, entry);
+      const stat = await fs.promises.stat(abs).catch(() => null);
+      if (!stat || !stat.isFile()) continue;
+
+      // Skip binary files: check first 512 bytes for null bytes
+      const fd = await fs.promises.open(abs, "r");
+      const buf = Buffer.alloc(512);
+      const { bytesRead } = await fd.read(buf, 0, 512, 0);
+      await fd.close();
+      if (buf.subarray(0, bytesRead).includes(0)) continue;  // Binary file
+
+      results.push(abs);
+    }
+  }
+  return [...new Set(results)];  // Deduplicate
+}
 ```
 
 ### 7.6 `rlm_stats` (FR-4.5)
@@ -1935,9 +2004,13 @@ function updateWidget(ctx: ExtensionContext) {
 
     // FR-6.5: Token counts
     const usage = ctx.getContextUsage();
-    if (usage) {
+    if (usage && usage.tokens !== null) {
       lines.push(
         theme.fg("dim", `  context: ${usage.tokens.toLocaleString()} tokens | store: ${formatTokens(index.totalTokens)}`)
+      );
+    } else {
+      lines.push(
+        theme.fg("dim", `  context: unknown | store: ${formatTokens(index.totalTokens)}`)
       );
     }
 
