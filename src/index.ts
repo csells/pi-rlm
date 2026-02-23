@@ -24,6 +24,10 @@ import { ExternalStore, getRlmStoreDir } from "./store/store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { buildRlmBatchTool } from "./tools/batch.js";
 import { buildRlmQueryTool } from "./tools/query.js";
+import { buildRlmPeekTool } from "./tools/peek.js";
+import { buildRlmSearchTool } from "./tools/search.js";
+import { buildRlmStatsTool } from "./tools/stats.js";
+import { buildRlmIngestTool } from "./tools/ingest.js";
 import { TrajectoryLogger } from "./trajectory.js";
 import { createWidgetUpdater } from "./ui/widget.js";
 import {
@@ -370,6 +374,46 @@ function registerTools(pi: any, state: RlmState): void {
     description: batchTool.description,
     parameters: batchTool.parameters,
     execute: batchTool.execute,
+  });
+
+  const peekTool = buildRlmPeekTool(state as any);
+
+  pi.registerTool({
+    name: peekTool.name,
+    label: peekTool.label,
+    description: peekTool.description,
+    parameters: peekTool.parameters,
+    execute: peekTool.execute,
+  });
+
+  const searchTool = buildRlmSearchTool(state as any);
+
+  pi.registerTool({
+    name: searchTool.name,
+    label: searchTool.label,
+    description: searchTool.description,
+    parameters: searchTool.parameters,
+    execute: searchTool.execute,
+  });
+
+  const statsTool = buildRlmStatsTool(state as any);
+
+  pi.registerTool({
+    name: statsTool.name,
+    label: statsTool.label,
+    description: statsTool.description,
+    parameters: statsTool.parameters,
+    execute: statsTool.execute,
+  });
+
+  const ingestTool = buildRlmIngestTool(state as any);
+
+  pi.registerTool({
+    name: ingestTool.name,
+    label: ingestTool.label,
+    description: ingestTool.description,
+    parameters: ingestTool.parameters,
+    execute: ingestTool.execute,
   });
 }
 

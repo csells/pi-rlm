@@ -1,0 +1,234 @@
+/**
+ * ExternalStore implementation.
+ * Manages externalized content on disk (JSONL) and in memory (cache).
+ * Per §11 of the design spec.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { StoreRecord, StoreIndex, StoreIndexEntry, ContentType, StoreObjectSource } from "./types.js";
+import { WriteQueue } from "./write-queue.js";
+
+/**
+ * ExternalStore — persists and retrieves externalized content.
+ *
+ * Data model:
+ * - JSONL file: .pi/rlm/<session-id>/store.jsonl (source of truth)
+ * - Index: in-memory Map<id, StoreRecord> + index.json (for crash recovery)
+ * - Content: cached in memory (fast synchronous access)
+ *
+ * All writes go through WriteQueue to serialize concurrent updates.
+ */
+export class ExternalStore {
+  private storeDir: string;
+  private sessionId: string;
+  private records: Map<string, StoreRecord> = new Map();
+  private index: StoreIndex;
+  private writeQueue: WriteQueue;
+  private externalizedMap: Map<string, string> = new Map(); // fingerprint → object ID
+
+  constructor(storeDir: string, sessionId: string) {
+    this.storeDir = storeDir;
+    this.sessionId = sessionId;
+    this.writeQueue = new WriteQueue();
+    this.index = {
+      version: 1,
+      sessionId,
+      objects: [],
+      totalTokens: 0,
+    };
+  }
+
+  /**
+   * Initialize the store — load from disk or create new.
+   * Called on session_start (§11.2).
+   */
+  async initialize(): Promise<void> {
+    try {
+      await fs.promises.mkdir(this.storeDir, { recursive: true });
+
+      const indexPath = path.join(this.storeDir, "index.json");
+      const storePath = path.join(this.storeDir, "store.jsonl");
+
+      // Try to load index
+      try {
+        const indexData = await fs.promises.readFile(indexPath, "utf-8");
+        const loadedIndex = JSON.parse(indexData) as StoreIndex;
+
+        if (loadedIndex.version === 1) {
+          this.index = loadedIndex;
+
+          // Load all records from JSONL
+          try {
+            const data = await fs.promises.readFile(storePath, "utf-8");
+            const lines = data.split("\n").filter((line) => line.trim());
+            for (const line of lines) {
+              const record: StoreRecord = JSON.parse(line);
+              this.records.set(record.id, record);
+            }
+          } catch (err) {
+            console.warn("[pi-rlm] Could not load store.jsonl, rebuilding from index", err);
+            // Fall back to empty (will rebuild on next write)
+          }
+        }
+      } catch (err) {
+        console.log("[pi-rlm] No existing store index, creating new store");
+      }
+
+      this.rebuildExternalizedMap();
+    } catch (err) {
+      console.error("[pi-rlm] Store initialization error:", err);
+      throw err;
+    }
+  }
+
+  /**
+   * Get a single record by ID (synchronous).
+   */
+  get(id: string): StoreRecord | null {
+    return this.records.get(id) ?? null;
+  }
+
+  /**
+   * Get an index entry by ID.
+   */
+  getIndexEntry(id: string): StoreIndexEntry | null {
+    return this.index.objects.find((entry) => entry.id === id) ?? null;
+  }
+
+  /**
+   * Add a record to the store.
+   * Returns the created StoreRecord immediately (sync).
+   * Enqueues async JSONL write and index update.
+   */
+  add(obj: Omit<StoreRecord, "id" | "createdAt">): StoreRecord {
+    const id = "rlm-obj-" + randomBytes(4).toString("hex");
+    const createdAt = Date.now();
+    const record: StoreRecord = { ...obj, id, createdAt };
+
+    // Update in-memory cache
+    this.records.set(id, record);
+
+    // Update index
+    const entry: StoreIndexEntry = {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      tokenEstimate: record.tokenEstimate,
+      createdAt: record.createdAt,
+      byteOffset: 0, // Will be calculated on write
+      byteLength: 0, // Will be calculated on write
+    };
+
+    this.index.objects.push(entry);
+    this.index.totalTokens += record.tokenEstimate;
+
+    // Enqueue write
+    void this.writeQueue.enqueue("store.add", async () => {
+      await this.writeRecordToJsonl(record);
+      await this.writeIndex();
+    });
+
+    return record;
+  }
+
+  /**
+   * Get all object IDs.
+   */
+  getAllIds(): string[] {
+    return Array.from(this.records.keys());
+  }
+
+  /**
+   * Get the full store index.
+   */
+  getFullIndex(): StoreIndex {
+    return {
+      ...this.index,
+      objects: [...this.index.objects],
+    };
+  }
+
+  /**
+   * Find an object by ingest path.
+   */
+  findByIngestPath(path: string): string | null {
+    for (const record of this.records.values()) {
+      if (record.source.kind === "ingested" && record.source.path === path) {
+        return record.id;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Flush all pending writes.
+   */
+  async flush(): Promise<void> {
+    return await this.writeQueue.flush();
+  }
+
+  /**
+   * Rebuild the externalized messages map from store records.
+   * Called on initialization (§11.2).
+   */
+  rebuildExternalizedMap(): void {
+    this.externalizedMap.clear();
+    for (const record of this.records.values()) {
+      if (record.source.kind === "externalized") {
+        this.externalizedMap.set(record.source.fingerprint, record.id);
+      }
+    }
+  }
+
+  /**
+   * Look up an externalized object by message fingerprint.
+   */
+  getExternalizedId(fingerprint: string): string | null {
+    return this.externalizedMap.get(fingerprint) ?? null;
+  }
+
+  /**
+   * Register an externalized message.
+   */
+  addExternalized(fingerprint: string, objectId: string): void {
+    this.externalizedMap.set(fingerprint, objectId);
+  }
+
+  /**
+   * Private: Write a record to the JSONL file.
+   */
+  private async writeRecordToJsonl(record: StoreRecord): Promise<void> {
+    const storePath = path.join(this.storeDir, "store.jsonl");
+    const line = JSON.stringify(record) + "\n";
+
+    try {
+      await fs.promises.appendFile(storePath, line, "utf-8");
+    } catch (err) {
+      console.error("[pi-rlm] Failed to write to store.jsonl:", err);
+      throw err;
+    }
+  }
+
+  /**
+   * Private: Write the index to index.json.
+   */
+  private async writeIndex(): Promise<void> {
+    const indexPath = path.join(this.storeDir, "index.json");
+
+    try {
+      await fs.promises.writeFile(indexPath, JSON.stringify(this.index, null, 2), "utf-8");
+    } catch (err) {
+      console.error("[pi-rlm] Failed to write index.json:", err);
+      throw err;
+    }
+  }
+}
+
+/**
+ * Helper: Get the RLM store directory for a session.
+ */
+export function getRlmStoreDir(cwd: string, sessionId: string): string {
+  return path.join(cwd, ".pi", "rlm", sessionId);
+}
