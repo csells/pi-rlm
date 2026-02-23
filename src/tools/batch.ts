@@ -21,6 +21,7 @@ export function buildRlmBatchTool(
   warmTracker: IWarmTracker,
   enabled: () => boolean,
   activePhases: Set<string>,
+  updateWidget?: (ctx: ExtensionContext) => void,
 ) {
   return {
     name: "rlm_batch",
@@ -84,6 +85,7 @@ export function buildRlmBatchTool(
         }
 
         activePhases.add("batching");
+        updateWidget?.(ctx);
 
         // Register operation in CallTree — tool owns lifecycle (C1 fix)
         const operationId = "rlm-batch-" + randomBytes(4).toString("hex");
@@ -107,6 +109,7 @@ export function buildRlmBatchTool(
 
           activePhases.delete("batching");
           activePhases.add("synthesizing");
+          updateWidget?.(ctx);
 
           // Format results
           const summary = results
@@ -126,6 +129,7 @@ export function buildRlmBatchTool(
           clearTimeout(opTimeout);
           signal?.removeEventListener("abort", onAbort);
           callTree.completeOperation(operationId);
+          updateWidget?.(ctx);
         }
       } catch (err) {
         console.error("[pi-rlm] rlm_batch error:", err);
@@ -136,6 +140,7 @@ export function buildRlmBatchTool(
       } finally {
         activePhases.delete("batching");
         activePhases.delete("synthesizing");
+        updateWidget?.(ctx);
       }
     },
   };

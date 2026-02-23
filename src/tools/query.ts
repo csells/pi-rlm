@@ -21,6 +21,7 @@ export function buildRlmQueryTool(
   warmTracker: IWarmTracker,
   enabled: () => boolean,
   activePhases: Set<string>,
+  updateWidget?: (ctx: ExtensionContext) => void,
 ) {
   return {
     name: "rlm_query",
@@ -86,6 +87,7 @@ export function buildRlmQueryTool(
         }
 
         activePhases.add("querying");
+        updateWidget?.(ctx);
 
         // Register operation in CallTree
         const operationId = "rlm-query-" + randomBytes(4).toString("hex");
@@ -117,6 +119,7 @@ export function buildRlmQueryTool(
           clearTimeout(opTimeout);
           signal?.removeEventListener("abort", onAbort);
           callTree.completeOperation(operationId);
+          updateWidget?.(ctx);
         }
       } catch (err) {
         console.error("[pi-rlm] rlm_query error:", err);
@@ -126,6 +129,7 @@ export function buildRlmQueryTool(
         };
       } finally {
         activePhases.delete("querying");
+        updateWidget?.(ctx);
       }
     },
   };

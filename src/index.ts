@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { homedir } from "node:os";
+import { registerCommands } from "./commands.js";
 import { DEFAULT_CONFIG } from "./config.js";
 import {
   ExternalizerState,
@@ -24,6 +25,7 @@ import { buildSystemPrompt } from "./system-prompt.js";
 import { buildRlmBatchTool } from "./tools/batch.js";
 import { buildRlmQueryTool } from "./tools/query.js";
 import { TrajectoryLogger } from "./trajectory.js";
+import { createWidgetUpdater } from "./ui/widget.js";
 import {
   ExtensionContext,
   IExternalStore,
@@ -72,7 +74,7 @@ function createBootstrapState(): RlmState {
 
   return {
     enabled: true,
-    config: DEFAULT_CONFIG,
+    config: { ...DEFAULT_CONFIG },
     store,
     manifest: new ManifestBuilder(store),
     engine,
@@ -97,6 +99,7 @@ function createBootstrapState(): RlmState {
  */
 export default function activate(pi: any): void {
   const state = createBootstrapState();
+  state.updateWidget = createWidgetUpdater(state);
 
   pi.on(
     "session_start",
@@ -143,6 +146,7 @@ export default function activate(pi: any): void {
   );
 
   registerTools(pi, state);
+  registerCommands(pi, state);
 }
 
 /**
@@ -337,6 +341,7 @@ function registerTools(pi: any, state: RlmState): void {
     state.warmTracker,
     () => state.enabled,
     state.activePhases,
+    state.updateWidget,
   );
 
   pi.registerTool({
@@ -356,6 +361,7 @@ function registerTools(pi: any, state: RlmState): void {
     state.warmTracker,
     () => state.enabled,
     state.activePhases,
+    state.updateWidget,
   );
 
   pi.registerTool({
