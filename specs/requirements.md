@@ -440,6 +440,9 @@ toggling off — only the active behavior changes.
 | `maxChildCalls` | 50 | Per-operation child call budget |
 | `childMaxTokens` | 4096 | Max output tokens per child call (`StreamOptions.maxTokens`) |
 | `enabled` | true | RLM mode on/off (toggled via `/rlm on` and `/rlm off`) |
+| `maxIngestFiles` | 1000 | Per-invocation file cap for `rlm_ingest` |
+| `maxIngestBytes` | 100,000,000 | Per-invocation total size cap (100MB) for `rlm_ingest` |
+| `retentionDays` | 30 | Days before old session store data is auto-cleaned |
 
 **FR-9.4** [SHOULD] The user **should** be able to configure model routing:
 which model to use for root calls vs. recursive child calls.

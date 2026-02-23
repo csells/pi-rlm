@@ -58,8 +58,7 @@ pi-rlm/
 │   │   └── cost.ts           # CostEstimator — uses model.cost metadata
 │   ├── tools/
 │   │   ├── peek.ts           # rlm_peek tool
-│   │   ├── search.ts         # rlm_search tool (with worker_threads regex timeout)
-│   │   ├── search-worker.ts  # Worker thread for regex execution (NFR-3.5)
+│   │   ├── search.ts         # rlm_search tool (with inline worker_threads regex timeout)
 │   │   ├── query.ts          # rlm_query tool
 │   │   ├── batch.ts          # rlm_batch tool
 │   │   ├── ingest.ts         # rlm_ingest tool
@@ -100,7 +99,7 @@ No external npm dependencies. The extension uses only:
 - `@sinclair/typebox` — tool parameter schemas
 - `node:fs`, `node:path`, `node:readline` — file I/O
 - `node:crypto` — UUID generation for object/call IDs
-- `node:worker_threads` — regex execution with timeout (NFR-3.5)
+- `node:worker_threads` — regex execution with timeout via inline workers (NFR-3.5)
 
 ---
 
@@ -157,12 +156,13 @@ interface RlmState {
   callTree: CallTree;             // Active operation tracking + abort registry
   costEstimator: CostEstimator;   // Cost estimation from model metadata
   trajectory: TrajectoryLogger;   // JSONL trajectory writer (all operations)
-  phase: Phase;                   // Current processing phase
+  activePhases: Set<Phase>;        // Currently active processing phases (supports concurrent tools)
   sessionId: string;              // Current session identifier
   firstRun: boolean;              // First session_start after install
   turnCount: number;              // LLM call counter (for warm tracking)
   allowCompaction: boolean;       // Safety valve flag (set in context, read in compact)
-  storeHealthy: boolean;          // Set false on unrecoverable store error
+  storeHealthy: boolean;          // Set false on unrecoverable store error; checked in context + compact handlers
+  forceExternalizeOnNextTurn: boolean; // Set by /rlm externalize, checked in context handler
 }
 ```
 
@@ -173,7 +173,7 @@ interface RlmState {
 | `ExternalStore` | Persist/retrieve externalized content on disk | FR-1 |
 | `ManifestBuilder` | Generate compact manifest for LLM context | FR-2 |
 | `ContextExternalizer` | `context` event handler — stub replacement + externalization | FR-3 |
-| `WarmTracker` | Track recently retrieved object IDs, prevent re-externalization | FR-3.9 |
+| `WarmTracker` | Track recently retrieved object IDs AND RLM tool call IDs, prevent re-externalization of retrieval results | FR-3.9 |
 | `RecursiveEngine` | Spawn child LLM calls via `stream()`/`complete()` | FR-5 |
 | `CallTree` | Track active operations for observability | FR-5.6, FR-10 |
 | `ConcurrencyLimiter` | Bound parallel child calls | FR-5.8 |
@@ -274,6 +274,20 @@ class CallTree {
   getOperationEstimate(operationId: string): number { ... }
   getOperationActual(operationId: string): number { ... }
 
+  /** Get the most recent active operation (for widget display). */
+  getActiveOperation(): OperationEntry | undefined {
+    for (const op of this.operations.values()) {
+      return op;  // First (most recent) entry
+    }
+    return undefined;
+  }
+
+  /** Update actual cost for an operation (called by CostEstimator). */
+  addActualCost(operationId: string, cost: number): void {
+    const op = this.operations.get(operationId);
+    if (op) op.actualCost += cost;
+  }
+
   // --- Per-operation budget (FR-5.9, FR-9.6) ---
   private maxChildCalls: number;  // Set from config
 }
@@ -337,24 +351,47 @@ function messageFingerprint(msg: AgentMessage): string {
   if ("toolCallId" in msg && msg.role === "toolResult") {
     return `toolResult:${msg.toolCallId}`;
   }
-  // All standard message types have a timestamp (ms precision)
-  if ("timestamp" in msg) {
-    return `${msg.role}:${msg.timestamp}`;
-  }
-  // Fallback: content hash (should not occur with current Pi types)
-  const content = typeof msg.content === "string"
+  // Composite fingerprint: role + timestamp + short content hash
+  // Using both timestamp and content hash protects against same-ms collisions
+  // (e.g., rapid programmatic message creation)
+  const contentSnippet = typeof msg.content === "string"
     ? msg.content.slice(0, 200)
-    : JSON.stringify(msg.content).slice(0, 200);
-  return `${msg.role}:${simpleHash(content)}`;
+    : Array.isArray(msg.content)
+      ? msg.content.filter(b => b.type === "text").map(b => b.text).join("").slice(0, 200)
+      : "";
+  const contentHash = simpleHash(contentSnippet);
+
+  if ("timestamp" in msg) {
+    return `${msg.role}:${msg.timestamp}:${contentHash}`;
+  }
+  // Fallback: role + content hash only (should not occur with current Pi types)
+  return `${msg.role}:${contentHash}`;
+}
+
+function simpleHash(str: string): string {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  }
+  return (hash >>> 0).toString(36);
 }
 ```
 
 **Why this works:** Every Pi message type includes a `timestamp` field
-(millisecond precision, set via `Date.now()` at creation). The combination of
-`role + timestamp` is unique within a session because Pi creates messages
-sequentially. For `toolResult` messages, `toolCallId` provides an even stronger
-unique identifier. The fingerprint is computed identically on every `context`
-event call, so it's stable across turns.
+(millisecond precision, set via `Date.now()` at creation). The composite
+fingerprint combines `role + timestamp + contentHash` to protect against
+same-millisecond collisions. For `toolResult` messages, `toolCallId` provides
+an even stronger unique identifier. The fingerprint is computed identically
+on every `context` event call, so it's stable across turns.
+
+**Conversation branching:** Pi supports multi-branch conversations. The
+fingerprint scheme is per-session, not per-branch. When branching occurs:
+(1) Messages from an inactive branch have stale fingerprint entries in
+`externalizedMessages` — these orphaned entries waste memory but are harmless
+(lookups miss). (2) If Pi re-creates messages when branching (new timestamps),
+content may be re-externalized under a new fingerprint, causing store
+duplicates. This is a known limitation — the store grows but doesn't corrupt.
+The manifest shows the latest version; duplicates are inert.
 
 **Reconstruction on restart:** `store.rebuildExternalizedMap()` iterates all
 `StoreRecord` entries with `source.kind === "externalized"`, and populates
@@ -394,13 +431,15 @@ interface StoreIndexEntry {
 The manifest is a text block injected into the **message array** by the
 `context` event handler (not `before_agent_start`). This ensures newly
 externalized objects appear in the same turn's manifest. The manifest is
-prepended as a **user-role message** at the start of the messages array.
+**prepended to the first user message's content**, not inserted as a separate
+message, to avoid breaking message alternation requirements.
 
-**Why user-role, not system-role:** Pi's `Message` type union (`UserMessage |
-AssistantMessage | ToolResultMessage`) does not include a system-role message
-variant. The system prompt is injected separately via `Context.systemPrompt`.
-Prepending a `UserMessage` with the manifest text is the correct approach and
-is consistent with how Pi's own extension examples inject context.
+**Why merge, not prepend a separate message:** Most LLM APIs (especially
+Anthropic Messages) require strict `user → assistant → user → assistant`
+alternation. Inserting a separate `UserMessage` before the first real user
+message creates consecutive user messages, which would cause API errors.
+Merging the manifest into the first user message's content preserves
+alternation while ensuring the model sees the manifest on every turn.
 
 Format:
 
@@ -509,6 +548,33 @@ interface OperationTrajectoryRecord {
 type TrajectoryRecord = CallTrajectoryRecord | OperationTrajectoryRecord;
 ```
 
+### 3.8 Search Match (used by `rlm_search`)
+
+```typescript
+interface SearchMatch {
+  objectId: string;
+  offset: number;                 // Character offset of match in object content
+  snippet: string;                // The matched text
+  context: string;                // ±100 chars surrounding the match for readability
+  error?: string;                 // Present if search failed for this object (timeout, error)
+}
+
+function formatSearchResults(matches: SearchMatch[]): string {
+  if (matches.length === 0) return "No matches found.";
+
+  const lines: string[] = [`Found ${matches.length} match(es):\n`];
+  for (const m of matches) {
+    if (m.error) {
+      lines.push(`**${m.objectId}**: ${m.error}`);
+    } else {
+      lines.push(`**${m.objectId}** [offset ${m.offset}]:`);
+      lines.push(`  ...${m.context}...`);
+    }
+  }
+  return lines.join("\n");
+}
+```
+
 **Rationale (NFR-4.1):** The requirements state "All RLM operations must be
 logged to the trajectory file." This includes externalization events, search
 operations, ingestion, and state toggles — not just recursive calls. The `kind`
@@ -531,6 +597,8 @@ interface RlmConfig {
   childMaxTokens: number;         // Default: 4096
   childModel?: string;            // Optional: "provider/model-id" for children
   retentionDays: number;          // Default: 30
+  maxIngestFiles: number;         // Default: 1000 — per-invocation file cap for rlm_ingest
+  maxIngestBytes: number;         // Default: 100_000_000 (100MB) — per-invocation total size cap
 }
 
 const DEFAULT_CONFIG: RlmConfig = {
@@ -546,6 +614,8 @@ const DEFAULT_CONFIG: RlmConfig = {
   maxChildCalls: 50,
   childMaxTokens: 4096,
   retentionDays: 30,
+  maxIngestFiles: 1000,
+  maxIngestBytes: 100_000_000,
 };
 ```
 
@@ -572,15 +642,13 @@ pi starts
           └── setupWidget(pi, state)
 ```
 
-**Tool availability when disabled (FR-9.2 — deviation from requirements):**
+**Tool availability when disabled (FR-9.2):**
 Tools are always registered because Pi's `ExtensionAPI` provides
 `registerTool()` but no `unregisterTool()` (verified in Pi's type definitions).
 Dynamic deregistration is not possible. Each tool's `execute()` method starts
 with `disabledGuard(state)` which returns an error result if `!state.enabled`.
-This achieves the intent of FR-8.1 and FR-9.2 ("RLM tools are deregistered")
-through the only mechanism available — the tools exist but are inert when
-disabled. **FR-8.1 and FR-9.2 in requirements.md should be updated to say
-"RLM tools are unavailable" instead of "RLM tools are deregistered."**
+The tools exist but are inert when disabled, consistent with FR-9.2's
+"guarded" semantics.
 
 ```typescript
 function disabledGuard(state: RlmState): ToolResult | null {
@@ -668,6 +736,9 @@ This is the core externalization handler. Called before every LLM call.
 async function onContext(event: any, ctx: ExtensionContext) {
   if (!state.enabled) return;
 
+  // Early bail: if the store is broken, don't interfere — let Pi handle context normally
+  if (!state.storeHealthy) return;
+
   state.turnCount++;
   state.warmTracker.tick();  // Decrement warm counters
 
@@ -678,49 +749,56 @@ async function onContext(event: any, ctx: ExtensionContext) {
   replaceExternalizedWithStubs(messages, state.store);
 
   // Phase 1: Check if new externalization is needed
-  // Note: ctx.getContextUsage() returns ContextUsage | undefined.
-  // ContextUsage.tokens can be null (e.g., right after compaction, before
-  // next LLM response). Skip externalization if tokens is unknown.
+  // Use post-stub token count (not ctx.getContextUsage()) for accurate threshold
+  // comparison. ctx.getContextUsage() reflects pre-modification messages, which
+  // would over-count after stubs have replaced large content.
   const usage = ctx.getContextUsage();
   if (usage && usage.tokens !== null && ctx.model) {
-    const model = ctx.model;
     const windowSize = usage.contextWindow;
     const threshold = windowSize * (state.config.tokenBudgetPercent / 100);
     const safetyThreshold = windowSize * (state.config.safetyValvePercent / 100);
 
-    if (usage.tokens > threshold) {
-      state.phase = "externalizing";
+    // Use actual post-stub token count for threshold comparison
+    const actualTokens = countMessageTokens(messages);
+
+    // Force externalize if /rlm externalize was called (regardless of threshold)
+    if (state.forceExternalizeOnNextTurn || actualTokens > threshold) {
+      state.activePhases.add("externalizing");
       updateWidget(ctx);
+      state.forceExternalizeOnNextTurn = false;
 
       // Externalize oldest/largest non-warm content
       // store.add() writes to memory immediately, enqueues disk I/O (NFR-2.1)
       externalize(messages, state, threshold);
     }
 
-    // Phase 2: Safety valve (FR-3.8)
-    const postUsage = countMessageTokens(messages);
+    // Phase 2: Safety valve (FR-3.8) — uses chars/3 for conservative estimate
+    const postUsage = countMessageTokensSafe(messages);
     if (postUsage > safetyThreshold) {
       forceExternalize(messages, state);
 
       // If STILL over safety threshold, allow compaction as last resort
-      const finalUsage = countMessageTokens(messages);
+      const finalUsage = countMessageTokensSafe(messages);
       if (finalUsage > safetyThreshold) {
         state.allowCompaction = true;
       }
     }
   }
 
-  // Phase 3: Inject manifest into messages (reflects current turn's state)
+  // Phase 3: Inject manifest into the first user message's content
+  // Merged into existing message to preserve user→assistant alternation.
   if (state.store.getFullIndex().objects.length > 0) {
     const manifest = state.manifest.build(state.config.manifestBudget);
-    messages.unshift({
-      role: "user",
-      content: [{ type: "text", text: manifest }],
-      timestamp: 0,  // Synthetic message — timestamp 0 sorts before all real messages
-    });
+    const firstUserIdx = messages.findIndex(m => m.role === "user");
+    if (firstUserIdx >= 0) {
+      const msg = messages[firstUserIdx];
+      if (Array.isArray(msg.content)) {
+        msg.content.unshift({ type: "text", text: manifest + "\n\n---\n\n" });
+      }
+    }
   }
 
-  state.phase = "idle";
+  state.activePhases.delete("externalizing");
   updateWidget(ctx);
 
   return { messages };
@@ -738,6 +816,9 @@ common case (stub replacement + manifest injection, no new externalization).
 ```typescript
 async function onBeforeCompact(event: any, ctx: ExtensionContext) {
   if (!state.enabled) return;
+
+  // If the store is broken, let Pi compact normally — we can't manage context
+  if (!state.storeHealthy) return;
 
   // Safety valve: if context handler couldn't reduce enough, allow compaction
   if (state.allowCompaction) {
@@ -761,6 +842,17 @@ async function onBeforeSwitch(event: any, ctx: ExtensionContext) {
   // Persist current config and index snapshot
   pi.appendEntry("rlm-config", state.config);
   pi.appendEntry("rlm-index", state.store.getFullIndex());
+}
+```
+
+### 4.7 `session_shutdown` Handler
+
+```typescript
+async function onShutdown(_event: any, ctx: ExtensionContext) {
+  // Flush pending writes — same as session_before_switch but without
+  // appendEntry (session may not accept new entries during shutdown)
+  await state.store.flush();
+  await state.trajectory.flush();
 }
 ```
 
@@ -792,8 +884,42 @@ function countMessageTokens(messages: Message[]): number {
 }
 ```
 
-This is a conservative estimate (4 chars/token). It's used only for
-post-modification threshold checks, not for billing.
+This is a conservative estimate (4 chars/token). It's used for the normal
+externalization threshold check (where overestimating is harmless — it may
+externalize slightly earlier than strictly necessary).
+
+For the **safety valve** threshold check (FR-3.8), a more conservative
+`countMessageTokensSafe()` variant is used with a 3 chars/token ratio. This
+ensures the safety valve triggers earlier (more false positives) rather than
+later (false negatives that cause failed LLM calls):
+
+```typescript
+function countMessageTokensSafe(messages: Message[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      total += Math.ceil(msg.content.length / 3);
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "text") {
+          total += Math.ceil(block.text.length / 3);
+        }
+        // Image blocks: estimate 1000 tokens per image (conservative)
+        if (block.type === "image") {
+          total += 1000;
+        }
+      }
+    }
+  }
+  return total;
+}
+```
+
+**Image/non-text content blocks:** Pi messages can contain image content
+blocks. These are passed through unchanged (not externalized). Token
+estimation for images uses a conservative 1000-token estimate per image.
+This may trigger externalization earlier than strictly necessary, which is
+the safe direction.
 
 ### 5.2 Normal Externalization (FR-3.2)
 
@@ -806,7 +932,12 @@ function externalize(messages, state, threshold):
     if message is most recent user message → skip (FR-3.6)
     if message is most recent assistant message → skip (FR-3.6)
 
-    // Warm check: look up whether this message's objectId is warm
+    // Warm check 1: RLM tool results are exempt for warmTurns (C5 fix)
+    // Any ToolResultMessage from an rlm_* tool is a retrieval result.
+    // Re-externalizing it would cause retrieve→externalize→retrieve thrashing.
+    if message.role === "toolResult" and warmTracker.isToolCallWarm(message.toolCallId) → skip
+
+    // Warm check 2: look up whether this message's store object is warm
     fp = messageFingerprint(message)
     objectId = externalizedMessages.get(fp)
     if objectId and warmTracker.isWarm(objectId) → skip (FR-3.9)
@@ -834,6 +965,63 @@ function externalize(messages, state, threshold):
 `StoreRecord` immediately). Enqueues JSONL append + index.json write to
 `WriteQueue`. Callers see the object in the index immediately; disk persistence
 is eventual but serialized.
+
+### 5.2.1 WarmTracker Dual-Tracking (FR-3.9 + C5)
+
+The `WarmTracker` tracks two kinds of warm references to prevent
+re-externalization thrashing:
+
+```typescript
+class WarmTracker {
+  private warmObjects = new Map<string, number>();    // objectId → remaining turns
+  private warmToolCalls = new Map<string, number>();  // toolCallId → remaining turns
+  private warmTurns: number;
+
+  constructor(warmTurns: number) { this.warmTurns = warmTurns; }
+
+  /** Mark store object IDs as warm (prevents externalization of source). */
+  markWarm(objectIds: string[]): void {
+    for (const id of objectIds) {
+      this.warmObjects.set(id, this.warmTurns);
+    }
+  }
+
+  /** Mark an RLM tool call ID as warm (prevents externalization of the result). */
+  markToolCallWarm(toolCallId: string): void {
+    this.warmToolCalls.set(toolCallId, this.warmTurns);
+  }
+
+  /** Check if a store object is warm. */
+  isWarm(objectId: string): boolean {
+    return (this.warmObjects.get(objectId) ?? 0) > 0;
+  }
+
+  /** Check if a tool call result is warm. */
+  isToolCallWarm(toolCallId: string): boolean {
+    return (this.warmToolCalls.get(toolCallId) ?? 0) > 0;
+  }
+
+  /** Decrement all warm counters. Called once per turn in context handler. */
+  tick(): void {
+    for (const [k, v] of this.warmObjects) {
+      if (v <= 1) this.warmObjects.delete(k);
+      else this.warmObjects.set(k, v - 1);
+    }
+    for (const [k, v] of this.warmToolCalls) {
+      if (v <= 1) this.warmToolCalls.delete(k);
+      else this.warmToolCalls.set(k, v - 1);
+    }
+  }
+}
+```
+
+**How this prevents thrashing:** When `rlm_peek` executes, it calls both
+`warmTracker.markWarm([params.id])` (for the source object) AND
+`warmTracker.markToolCallWarm(toolCallId)` (for the result message). On the
+next context event, the externalization algorithm checks
+`warmTracker.isToolCallWarm(message.toolCallId)` for `ToolResultMessage`s,
+which catches the *result* of the retrieval. This breaks the
+retrieve→externalize→retrieve cycle.
 
 ### 5.3 Force Externalization (FR-3.8)
 
@@ -910,7 +1098,6 @@ No LLM calls for descriptions — they're heuristic, fast, and free.
 ```typescript
 class RecursiveEngine {
   constructor(
-    private modelRegistry: ModelRegistry,
     private config: RlmConfig,
     private store: ExternalStore,
     private trajectory: TrajectoryLogger,
@@ -934,13 +1121,19 @@ class RecursiveEngine {
     targetIds: string[],
     parentCallId: string | null,
     depth: number,
-    operationId: string,          // For per-operation budget tracking
-    operationSignal: AbortSignal,
+    operationId: string,          // Passed from rlm_batch tool — tool owns operation lifecycle
+    operationSignal: AbortSignal, // Passed from rlm_batch tool — tool owns AbortController
     ctx: ExtensionContext,
     modelOverride?: string,
   ): Promise<ChildCallResult[]> { ... }
 }
 ```
+
+**Operation ownership rule:** The **tool** (§7.3, §7.4) is the sole owner of
+operation registration and cleanup in the CallTree. The engine **never**
+registers operations — it receives `operationId` and `operationSignal` as
+parameters from the tool. This prevents double registration, ensures a single
+cancellation path, and keeps budget accounting in one place.
 
 ### 6.2 Model Resolution
 
@@ -966,6 +1159,9 @@ function resolveChildModel(
   return ctx.model;
 }
 ```
+
+Model resolution uses `ctx` at call time (not a stored `modelRegistry`),
+which is correct because the model may change mid-session.
 
 Callers of `resolveChildModel()` **must** check for `null` and return an error
 `ChildCallResult` if no model is available:
@@ -1061,40 +1257,32 @@ RecursiveEngine.query(instructions, targetIds, parentId, depth, operationId, sig
 ### 6.4 Batch Call Flow (`batch`)
 
 ```
-RecursiveEngine.batch(instructions, targetIds, parentId, depth, signal, ctx, modelOverride):
-  1. Generate operationId = "rlm-batch-" + crypto.randomUUID().slice(0,8)
+RecursiveEngine.batch(instructions, targetIds, parentId, depth, operationId, operationSignal, ctx, modelOverride):
+  // NOTE: The tool owns operation registration and cleanup.
+  // operationId and operationSignal are passed from the rlm_batch tool.
+  // The engine does NOT register a separate operation.
 
-  2. Register operation in CallTree — get back an AbortController:
-     opController = callTree.registerOperation(operationId, estimatedCost)
-     opTimeout = setTimeout(() => opController.abort(), config.operationTimeoutSec * 1000)
-     // Chain parent signal → operation controller
-     const onAbort = () => opController.abort()
-     signal.addEventListener("abort", onAbort, { once: true })
-
-  3. Build task list:
+  1. Build task list:
      tasks = targetIds.map(id => ({
        targetId: id,
        instructions: instructions,
      }))
 
-  4. Execute with concurrency limiter:
+  2. Execute with concurrency limiter:
      limiter = new ConcurrencyLimiter(config.maxConcurrency)
      results = await limiter.map(tasks, async (task) => {
        // Per-operation budget check (FR-5.9, FR-9.6)
        if (!callTree.incrementChildCalls(operationId)) {
-         opController.abort()  // Cancel remaining children via shared signal
+         operationSignal.dispatchEvent?.(new Event("abort"))  // Cancel remaining
          return { answer: "Budget exceeded", confidence: "low", evidence: [] }
        }
        return await this.query(
          task.instructions, [task.targetId],
-         operationId, depth, opController.signal, ctx, modelOverride
+         parentId, depth, operationId, operationSignal, ctx, modelOverride
        )
      })
 
-  5. clearTimeout(opTimeout)
-     signal.removeEventListener("abort", onAbort)
-     callTree.completeOperation(operationId)
-  6. Return results (including partial results from completed children)
+  3. Return results (including partial results from completed children)
 ```
 
 **Per-operation budget scoping (FR-5.9):** The child call counter is tracked
@@ -1102,6 +1290,10 @@ per-operation inside `CallTree.OperationEntry.childCallsUsed`, not as a global
 counter. Each `rlm_query` or `rlm_batch` invocation starts with a fresh
 counter. This means one `rlm_batch(50 targets)` consuming its full budget
 does not prevent a subsequent `rlm_query` from running.
+
+**No double registration:** The engine never calls `callTree.registerOperation()`.
+Only the tool (§7.4) does. This ensures one operation entry, one AbortController,
+one budget counter, and one cleanup path per logical operation.
 
 ### 6.5 Child Agent Loop
 
@@ -1142,17 +1334,33 @@ async function runChildAgentLoop(
     messages.push(response);
     for (const toolCall of toolCalls) {
       const handler = toolHandlers.get(toolCall.name);
+      let resultText: string;
+      let isError: boolean;
+
       if (handler) {
-        const result = await handler(toolCall.arguments);  // ToolCall.arguments, not .input
-        messages.push({
-          role: "toolResult",
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,           // Required by ToolResultMessage
-          content: [{ type: "text", text: result }],
-          isError: false,                    // Required by ToolResultMessage
-          timestamp: Date.now(),             // Required by ToolResultMessage
-        } satisfies ToolResultMessage);
+        try {
+          resultText = await handler(toolCall.arguments);  // ToolCall.arguments, not .input
+          isError = false;
+        } catch (err) {
+          resultText = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+          isError = true;
+        }
+      } else {
+        // Unknown tool — return an error result to maintain the tool-call/tool-result contract.
+        // Most LLM APIs require a tool result for every tool call; silently skipping would
+        // cause the provider to error or the model to loop.
+        resultText = `Unknown tool: ${toolCall.name}. Available tools: ${[...toolHandlers.keys()].join(", ")}`;
+        isError = true;
       }
+
+      messages.push({
+        role: "toolResult",
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,           // Required by ToolResultMessage
+        content: [{ type: "text", text: resultText }],
+        isError,                           // Reflects actual success/failure
+        timestamp: Date.now(),             // Required by ToolResultMessage
+      } satisfies ToolResultMessage);
     }
     turns++;
   }
@@ -1169,6 +1377,74 @@ async function runChildAgentLoop(
   return "Max turns reached";
 }
 ```
+
+### 6.5.1 Child Tool Handler Factory
+
+Children at depth < maxDepth need access to RLM tools. These handlers are
+lightweight closures over shared state — they are NOT the same as the
+Pi-registered tools (which have Pi's full `execute` signature).
+
+```typescript
+function buildChildToolHandlers(
+  store: ExternalStore,
+  engine: RecursiveEngine,
+  callTree: CallTree,
+  warmTracker: WarmTracker,
+  depth: number,
+  operationId: string,
+  operationSignal: AbortSignal,
+  ctx: ExtensionContext,
+  config: RlmConfig,
+): Map<string, (args: Record<string, any>) => Promise<string>> {
+  const handlers = new Map<string, (args: Record<string, any>) => Promise<string>>();
+
+  // rlm_peek — always available to children
+  handlers.set("rlm_peek", async (args) => {
+    const obj = store.get(args.id);
+    if (!obj) return `Object ${args.id} not found`;
+    const slice = obj.content.slice(args.offset ?? 0, (args.offset ?? 0) + (args.length ?? 2000));
+    warmTracker.markWarm([args.id]);
+    return slice;
+  });
+
+  // rlm_search — always available to children
+  handlers.set("rlm_search", async (args) => {
+    const regex = parsePattern(args.pattern);
+    const objectIds = args.scope ?? store.getAllIds();
+    const matches: SearchMatch[] = [];
+    for (const id of objectIds) {
+      const obj = store.get(id);
+      if (!obj) continue;
+      const objMatches = await searchWithWorkerTimeout(obj.content, regex, id, 5000);
+      matches.push(...objMatches);
+      if (matches.length >= 50) break;
+    }
+    warmTracker.markWarm(matches.map(m => m.objectId));
+    return formatSearchResults(matches);
+  });
+
+  // rlm_query — only at depth < maxDepth (children can recurse further)
+  if (depth + 1 < config.maxDepth) {
+    handlers.set("rlm_query", async (args) => {
+      const targetIds = Array.isArray(args.target) ? args.target : [args.target];
+      const result = await engine.query(
+        args.instructions, targetIds, null, depth + 1,
+        operationId, operationSignal, ctx, args.model
+      );
+      return JSON.stringify(result);
+    });
+  }
+
+  return handlers;
+}
+```
+
+**Key points:**
+- Handlers share the same `operationId` and `operationSignal` as their parent,
+  so budget counting and cancellation propagate correctly.
+- `rlm_query` inside a child increments `depth + 1`, enforcing the max depth.
+- At max depth, `rlm_query` is not in the handler map, so calling it returns
+  an "Unknown tool" error (§6.5), which the child can recover from.
 
 **Note on `complete()` return type:** `complete()` returns `AssistantMessage`
 whose `content` is `(TextContent | ThinkingContent | ToolCall)[]`. There are
@@ -1202,6 +1478,9 @@ async function retryWithBackoff(
 ### 6.7 Cost Estimation (FR-6.6, FR-9.5)
 
 ```typescript
+// Overhead per child call: system prompt (~600 tokens) + tool definitions (~300 tokens each)
+const CHILD_OVERHEAD_TOKENS = 1000;
+
 class CostEstimator {
   estimateQuery(
     targetIds: string[],
@@ -1209,16 +1488,21 @@ class CostEstimator {
     model: Model,
   ): { estimatedCalls: number; estimatedCost: number } {
     // rlm_query joins all targets into ONE child call
+    // If child has tools and depth < maxDepth, it may recurse — estimate conservatively
     const totalInputTokens = targetIds.reduce((sum, id) => {
       const entry = this.store.getIndexEntry(id);
       return sum + (entry?.tokenEstimate ?? 0);
-    }, 0);
+    }, 0) + CHILD_OVERHEAD_TOKENS;
 
+    // model.cost.input and model.cost.output are in $/Mtok (dollars per million tokens)
     const costPerCall =
-      (totalInputTokens * model.cost.input) +
-      (config.childMaxTokens * model.cost.output);
+      (totalInputTokens * model.cost.input / 1_000_000) +
+      (config.childMaxTokens * model.cost.output / 1_000_000);
 
-    return { estimatedCalls: 1, estimatedCost: costPerCall };
+    // Conservative: assume child may spawn 1 recursive call if depth allows
+    const estimatedCalls = 1 + (config.maxDepth > 1 ? 1 : 0);
+
+    return { estimatedCalls, estimatedCost: costPerCall * estimatedCalls };
   }
 
   estimateBatch(
@@ -1228,14 +1512,15 @@ class CostEstimator {
   ): { estimatedCalls: number; estimatedCost: number } {
     // rlm_batch spawns ONE child per target
     const estimatedCalls = targetIds.length;
-    const avgInputTokens = targetIds.reduce((sum, id) => {
+    const avgInputTokens = (targetIds.reduce((sum, id) => {
       const entry = this.store.getIndexEntry(id);
       return sum + (entry?.tokenEstimate ?? 0);
-    }, 0) / Math.max(estimatedCalls, 1);
+    }, 0) / Math.max(estimatedCalls, 1)) + CHILD_OVERHEAD_TOKENS;
 
+    // model.cost.input and model.cost.output are in $/Mtok (dollars per million tokens)
     const costPerCall =
-      (avgInputTokens * model.cost.input) +
-      (config.childMaxTokens * model.cost.output);
+      (avgInputTokens * model.cost.input / 1_000_000) +
+      (config.childMaxTokens * model.cost.output / 1_000_000);
 
     return {
       estimatedCalls,
@@ -1251,43 +1536,47 @@ class CostEstimator {
     model: Model,
     callTree: CallTree,
   ) {
+    // model.cost rates are in $/Mtok
     const cost =
-      (tokensIn * model.cost.input) +
-      (tokensOut * model.cost.output);
-    const op = callTree.operations.get(operationId);
-    if (op) op.actualCost += cost;
+      (tokensIn * model.cost.input / 1_000_000) +
+      (tokensOut * model.cost.output / 1_000_000);
+    callTree.addActualCost(operationId, cost);
   }
 }
 ```
 
+**Cost unit convention:** Pi's `Model.cost.input` and `Model.cost.output` are
+in **dollars per million tokens** (industry standard: e.g., `3.0` = $3/Mtok
+for Claude Sonnet input). All cost calculations divide token counts by
+1,000,000 before multiplying by rates. A 10K-token input at $3/Mtok costs
+$0.03, not $30,000.
+
 **Dual cost tracking (FR-6.6):** The `estimateQuery()` and `estimateBatch()`
 methods compute the **pre-run estimate** (set on the `OperationEntry` via
 `registerOperation()`). The `addCallCost()` method accumulates the **running
-actual cost** on the same `OperationEntry`. The widget (§10.1) displays both:
+actual cost** via `callTree.addActualCost()`. The widget (§10.1) displays both:
 `est: $0.0042 actual: $0.0018` — giving the user a before/during view.
 
 Note: `Model.cost` is always present (not optional) per Pi's type definitions.
 Values may be 0 for free-tier models, which results in `$0.0000` displays —
 acceptable and honest.
-```
 
 ---
 
 ## 7. Tool Implementations
 
 All tools start with `disabledGuard(state)` and wrap their body in
-`try/finally` to reset `state.phase`. All tools apply truncation to output
-(FR-4.9).
+`try/finally` to clean up `state.activePhases`. All tools apply truncation to
+output (FR-4.9). All tools log to the trajectory file (NFR-4.1).
 
 ### 7.1 `rlm_peek` (FR-4.1)
 
-**Offset semantics (deviation from FR-4.1):** FR-4.1 specifies "byte/line
-offset." The design uses **character offset** because: (a) Pi's built-in `read`
-tool uses character/line offsets, not byte offsets, (b) externalized content is
-always UTF-8 strings where character indexing via `String.slice()` is natural,
-and (c) byte offsets would require Buffer conversion for every peek, adding
-complexity with no benefit for text content. **FR-4.1 in requirements.md should
-be updated to say "character offset" instead of "byte/line offset."**
+**Offset semantics:** The design uses **character offset** because: (a) Pi's
+built-in `read` tool uses character/line offsets, not byte offsets, (b)
+externalized content is always UTF-8 strings where character indexing via
+`String.slice()` is natural, and (c) byte offsets would require Buffer
+conversion for every peek, adding complexity with no benefit for text content.
+This is consistent with FR-4.1's "character offset" semantics.
 
 ```typescript
 pi.registerTool({
@@ -1303,11 +1592,21 @@ pi.registerTool({
     const guard = disabledGuard(state);
     if (guard) return guard;
 
+    const peekStart = Date.now();
     const obj = state.store.get(params.id);
     if (!obj) return errorResult(`Object ${params.id} not found`);
 
     const slice = obj.content.slice(params.offset, params.offset + params.length);
     state.warmTracker.markWarm([params.id]);
+    state.warmTracker.markToolCallWarm(toolCallId);  // Prevent re-externalization of this result
+
+    // Log to trajectory (NFR-4.1)
+    state.trajectory.append({
+      kind: "operation", operation: "peek",
+      objectIds: [params.id],
+      details: { offset: params.offset, length: params.length },
+      wallClockMs: Date.now() - peekStart, timestamp: Date.now(),
+    });
 
     const truncation = truncateHead(slice, {
       maxLines: DEFAULT_MAX_LINES,
@@ -1342,7 +1641,7 @@ pi.registerTool({
     const guard = disabledGuard(state);
     if (guard) return guard;
 
-    state.phase = "searching";
+    state.activePhases.add("searching");
     updateWidget(ctx);
     const searchStart = Date.now();
 
@@ -1363,6 +1662,7 @@ pi.registerTool({
       }
 
       state.warmTracker.markWarm(matches.map(m => m.objectId));
+      state.warmTracker.markToolCallWarm(toolCallId);  // Prevent re-externalization of this result
 
       // NFR-4.1: Log non-recursive operations to trajectory
       state.trajectory.append({
@@ -1387,7 +1687,7 @@ pi.registerTool({
 
       return { content: [{ type: "text", text: result }], details: {} };
     } finally {
-      state.phase = "idle";
+      state.activePhases.delete("searching");
       updateWidget(ctx);
     }
   },
@@ -1399,44 +1699,46 @@ synchronous and non-interruptible from the main thread. The design uses
 `node:worker_threads` to run regex matching in a separate thread:
 
 ```typescript
-// search-worker.ts — runs in a Worker thread
-import { parentPort, workerData } from "node:worker_threads";
+// Worker code is inlined as a string to avoid TypeScript loading issues.
+// node:worker_threads does NOT use jiti — it uses Node's native module loader,
+// which cannot load .ts files. Inlining via `eval: true` is the most portable approach.
+const SEARCH_WORKER_CODE = `
+const { parentPort, workerData } = require("node:worker_threads");
 const { content, pattern, flags } = workerData;
 const regex = new RegExp(pattern, flags);
 const matches = [];
 let match;
 while ((match = regex.exec(content)) !== null) {
-  matches.push({ index: match.index, text: match[0] });
+  matches.push({ index: match.index, text: match[0],
+    context: content.slice(Math.max(0, match.index - 100), match.index + match[0].length + 100) });
   if (matches.length >= 100) break;
   if (!regex.global) break;
 }
-parentPort?.postMessage(matches);
-
-// In search.ts
-// Worker path: use __dirname for reliable resolution under jiti/hot-reload.
-// The extension is loaded via jiti which compiles TypeScript; __dirname
-// resolves to the extension's source directory at runtime.
-const SEARCH_WORKER_PATH = path.join(__dirname, "search-worker.ts");
+parentPort.postMessage(matches);
+`;
 
 async function searchWithWorkerTimeout(
   content: string, regex: RegExp, objectId: string, timeoutMs: number
 ): Promise<SearchMatch[]> {
   return new Promise((resolve) => {
-    const worker = new Worker(SEARCH_WORKER_PATH, {
+    const worker = new Worker(SEARCH_WORKER_CODE, {
+      eval: true,  // Inline code — no .ts file loading issues
       workerData: { content, pattern: regex.source, flags: regex.flags },
     });
     const timer = setTimeout(() => {
       worker.terminate();
-      resolve([{ objectId, error: "Regex timed out after 5s" }]);
+      resolve([{ objectId, offset: 0, snippet: "", context: "", error: "Regex timed out after 5s" }]);
     }, timeoutMs);
     worker.on("message", (matches) => {
       clearTimeout(timer);
       worker.terminate();
-      resolve(matches.map(m => ({ objectId, offset: m.index, snippet: m.text })));
+      resolve(matches.map(m => ({
+        objectId, offset: m.index, snippet: m.text, context: m.context
+      })));
     });
     worker.on("error", () => {
       clearTimeout(timer);
-      resolve([{ objectId, error: "Regex error" }]);
+      resolve([{ objectId, offset: 0, snippet: "", context: "", error: "Regex error" }]);
     });
   });
 }
@@ -1463,9 +1765,11 @@ pi.registerTool({
 
     const targetIds = Array.isArray(params.target) ? params.target : [params.target];
 
-    // Cost check (FR-9.5)
+    // Cost check (FR-9.5) — confirm if estimated calls exceed threshold
     const childModel = resolveChildModel(params.model, state.config, ctx);
+    if (!childModel) return errorResult("No model available for recursive call. Select a model first.");
     const estimate = state.costEstimator.estimateQuery(targetIds, state.config, childModel);
+    // rlm_query typically spawns 1-2 calls; confirm if recursion could expand beyond threshold
     if (estimate.estimatedCalls > 10) {
       if (ctx.hasUI) {
         const ok = await ctx.ui.confirm(
@@ -1478,7 +1782,7 @@ pi.registerTool({
       }
     }
 
-    state.phase = "querying";
+    state.activePhases.add("querying");
     updateWidget(ctx);
 
     // Register operation in CallTree — get back an AbortController (FR-9.1)
@@ -1514,7 +1818,7 @@ pi.registerTool({
       clearTimeout(opTimeout);
       signal?.removeEventListener("abort", onAbort);
       state.callTree.completeOperation(operationId);
-      state.phase = "idle";
+      state.activePhases.delete("querying");
       updateWidget(ctx);
     }
   },
@@ -1539,6 +1843,7 @@ pi.registerTool({
 
     // Cost check
     const childModel = resolveChildModel(params.model, state.config, ctx);
+    if (!childModel) return errorResult("No model available for recursive call. Select a model first.");
     const estimate = state.costEstimator.estimateBatch(params.targets, state.config, childModel);
     if (estimate.estimatedCalls > 10) {
       if (ctx.hasUI) {
@@ -1552,10 +1857,10 @@ pi.registerTool({
       }
     }
 
-    state.phase = "batching";
+    state.activePhases.add("batching");
     updateWidget(ctx);
 
-    // Register operation in CallTree — get back an AbortController (FR-9.1)
+    // Register operation in CallTree — tool owns lifecycle (C1 fix)
     const operationId = "rlm-batch-" + crypto.randomUUID().slice(0, 8);
     const opController = state.callTree.registerOperation(operationId, estimate.estimatedCost);
     const opTimeout = setTimeout(() => opController.abort(), state.config.operationTimeoutSec * 1000);
@@ -1563,11 +1868,14 @@ pi.registerTool({
     signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
+      // Pass all 8 args matching engine.batch() signature (C2 fix)
       const results = await state.engine.batch(
-        params.instructions, params.targets, null, 0, opController.signal, ctx, params.model
+        params.instructions, params.targets, null, 0,
+        operationId, opController.signal, ctx, params.model
       );
 
-      state.phase = "synthesizing";
+      state.activePhases.delete("batching");
+      state.activePhases.add("synthesizing");
       updateWidget(ctx);
 
       const summary = results.map((r, i) => {
@@ -1595,7 +1903,8 @@ pi.registerTool({
       clearTimeout(opTimeout);
       signal?.removeEventListener("abort", onAbort);
       state.callTree.completeOperation(operationId);
-      state.phase = "idle";
+      state.activePhases.delete("batching");
+      state.activePhases.delete("synthesizing");
       updateWidget(ctx);
     }
   },
@@ -1616,21 +1925,49 @@ pi.registerTool({
     const guard = disabledGuard(state);
     if (guard) return guard;
 
-    state.phase = "ingesting";
+    state.activePhases.add("ingesting");
     updateWidget(ctx);
+    const ingestStart = Date.now();
 
     try {
       // resolveGlobs: expand glob patterns relative to cwd, return absolute paths.
       // Uses Node's built-in fs.glob() (Node 22+) or a simple readdir+minimatch fallback.
       // Skips: node_modules, .git, binary files (detected via null-byte check on first 512 bytes).
       const resolvedPaths = await resolveGlobs(params.paths, ctx.cwd);
+
+      // Enforce file count limit (I8 fix)
+      if (resolvedPaths.length > state.config.maxIngestFiles) {
+        return errorResult(
+          `Too many files: ${resolvedPaths.length} matched, limit is ${state.config.maxIngestFiles}. ` +
+          `Use more specific patterns to narrow the scope.`
+        );
+      }
+
       const objectIds: string[] = [];
+      const skipped: string[] = [];
+      let totalBytes = 0;
 
       for (const filePath of resolvedPaths) {
         if (signal?.aborted) break;
 
+        // Enforce total size limit (I8 fix)
+        if (totalBytes >= state.config.maxIngestBytes) {
+          skipped.push(`${filePath} (size limit reached)`);
+          continue;
+        }
+
         try {
           const content = await fs.promises.readFile(filePath, "utf-8");
+          totalBytes += content.length;
+
+          // Deduplication: skip if already ingested from same path (M3 fix)
+          const existingId = state.store.findByIngestPath(filePath);
+          if (existingId) {
+            objectIds.push(existingId);
+            skipped.push(`${filePath} (already ingested)`);
+            continue;
+          }
+
           const obj = state.store.add({
             type: "file",
             description: path.relative(ctx.cwd, filePath),
@@ -1647,7 +1984,19 @@ pi.registerTool({
         }
       }
 
-      const text = `Ingested ${objectIds.length} files. Object IDs:\n${objectIds.join("\n")}`;
+      // Log to trajectory (NFR-4.1)
+      state.trajectory.append({
+        kind: "operation", operation: "ingest",
+        objectIds,
+        details: { paths: params.paths, fileCount: objectIds.length, skipped: skipped.length, totalBytes },
+        wallClockMs: Date.now() - ingestStart, timestamp: Date.now(),
+      });
+
+      let text = `Ingested ${objectIds.length} files. Object IDs:\n${objectIds.join("\n")}`;
+      if (skipped.length > 0) {
+        text += `\n\nSkipped ${skipped.length} files: ${skipped.slice(0, 10).join(", ")}`;
+        if (skipped.length > 10) text += ` (+${skipped.length - 10} more)`;
+      }
       const truncation = truncateHead(text, {
         maxLines: DEFAULT_MAX_LINES,
         maxBytes: DEFAULT_MAX_BYTES,
@@ -1658,12 +2007,18 @@ pi.registerTool({
         details: { objectIds },
       };
     } finally {
-      state.phase = "idle";
+      state.activePhases.delete("ingesting");
       updateWidget(ctx);
     }
   },
 });
 ```
+
+**Store deduplication (M3):** `store.findByIngestPath(path)` scans the
+in-memory index for objects with `source.kind === "ingested"` and matching
+`source.path`. Returns the existing object ID if found, `null` otherwise.
+This prevents duplicate ingestion when the model calls `rlm_ingest` on the
+same glob multiple times.
 
 ### 7.5.1 `resolveGlobs` Helper
 
@@ -1710,6 +2065,7 @@ pi.registerTool({
     const guard = disabledGuard(state);
     if (guard) return guard;
 
+    const statsStart = Date.now();
     const index = state.store.getFullIndex();
     const usage = ctx.getContextUsage();
     const activeOps = state.callTree.getActive();
@@ -1723,6 +2079,13 @@ pi.registerTool({
       `Current depth: ${state.callTree.maxActiveDepth()}`,
       `Config: maxDepth=${state.config.maxDepth}, maxConcurrency=${state.config.maxConcurrency}, maxChildCalls=${state.config.maxChildCalls}`,
     ].join("\n");
+
+    // Log to trajectory (NFR-4.1)
+    state.trajectory.append({
+      kind: "operation", operation: "stats", objectIds: [],
+      details: { objectCount: index.objects.length, totalTokens: index.totalTokens },
+      wallClockMs: Date.now() - statsStart, timestamp: Date.now(),
+    });
 
     // rlm_stats output is already small — truncation applied for consistency
     const truncation = truncateHead(text, {
@@ -1842,12 +2205,21 @@ and returned to the LLM.
 ```typescript
 // /rlm config — show/edit settings
 // /rlm inspect — open inspector overlay
-// /rlm externalize — force immediate externalization
 // /rlm store — show store contents
 // Implementations follow the same pattern as /rlm above.
 // /rlm inspect calls showInspector(ctx) from §10.2.
-// /rlm externalize sets state.phase = "externalizing" and triggers
-// the externalization algorithm on the next context event.
+
+// /rlm externalize — force immediate externalization on next turn
+if (subcommand === "externalize") {
+  state.forceExternalizeOnNextTurn = true;
+  if (ctx.hasUI) {
+    ctx.ui.notify(
+      "Externalization will run on the next LLM call. Send a message to trigger it.",
+      "info"
+    );
+  }
+  return;
+}
 ```
 
 ---
@@ -1962,61 +2334,79 @@ reasoning process — just provide the answer with supporting evidence.
 ```typescript
 import { Text } from "@mariozechner/pi-tui";
 
+// Debounce widget updates to prevent TUI flicker during rapid tool sequences (M9)
+let widgetDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let lastWidgetText = "";
+
 function updateWidget(ctx: ExtensionContext) {
   if (!ctx.hasUI) return;
 
-  ctx.ui.setWidget("rlm", (tui, theme) => {
-    if (!state.enabled) {
-      // FR-6.2: Off state
-      return new Text(theme.fg("dim", "RLM: off"), 0, 0);
-    }
+  if (widgetDebounceTimer) clearTimeout(widgetDebounceTimer);
+  widgetDebounceTimer = setTimeout(() => {
+    ctx.ui.setWidget("rlm", (tui, theme) => {
+      if (!state.enabled) {
+        // FR-6.2: Off state
+        return new Text(theme.fg("dim", "RLM: off"), 0, 0);
+      }
 
-    const index = state.store.getFullIndex();
+      const index = state.store.getFullIndex();
 
-    if (state.phase === "idle") {
-      // FR-6.3: On-idle state (FR-14.2: includes /rlm off hint)
-      const tokens = formatTokens(index.totalTokens);
-      const text = theme.fg("accent", "RLM: on") +
-        theme.fg("muted", ` (${index.objects.length} objects, ${tokens})`) +
-        theme.fg("dim", " | /rlm off to disable");
-      return new Text(text, 0, 0);
-    }
+      if (state.activePhases.size === 0) {
+        // FR-6.3: On-idle state (FR-14.2: includes /rlm off hint)
+        const tokens = formatTokens(index.totalTokens);
+        const text = theme.fg("accent", "RLM: on") +
+          theme.fg("muted", ` (${index.objects.length} objects, ${tokens})`) +
+          theme.fg("dim", " | /rlm off to disable");
+        return new Text(text, 0, 0);
+      }
 
-    // FR-6.4: Active state
-    const active = state.callTree.getActive();
-    const depth = state.callTree.maxActiveDepth();
-    // Per-operation budget from active operation (if any)
-    const activeOp = [...state.callTree.operations.values()][0]; // Most recent
-    const budget = activeOp
-      ? `${activeOp.childCallsUsed}/${state.config.maxChildCalls}`
-      : "0";
-    // FR-6.6: Show BOTH estimated cost (pre-run) and actual cost (running)
-    const estCost = activeOp?.estimatedCost ?? 0;
-    const actCost = activeOp?.actualCost ?? 0;
-    const costStr = estCost > 0 || actCost > 0
-      ? ` | est: $${estCost.toFixed(4)} actual: $${actCost.toFixed(4)}`
-      : "";
+      // FR-6.4: Active state — show highest-priority phase from the Set
+      const phasePriority: Phase[] = ["batching", "querying", "synthesizing", "ingesting", "searching", "externalizing"];
+      const displayPhase = phasePriority.find(p => state.activePhases.has(p)) ?? "processing";
 
-    const lines = [
-      theme.fg("warning", `RLM: ${state.phase}`) +
-        theme.fg("muted", ` | depth: ${depth} | children: ${active.length} | budget: ${budget}${costStr}`),
-    ];
+      const active = state.callTree.getActive();
+      const depth = state.callTree.maxActiveDepth();
+      // Per-operation budget via public accessor (not private .operations)
+      const activeOp = state.callTree.getActiveOperation();
+      const budget = activeOp
+        ? `${activeOp.childCallsUsed}/${state.config.maxChildCalls}`
+        : "0";
+      // FR-6.6: Show BOTH estimated cost (pre-run) and actual cost (running)
+      const estCost = activeOp?.estimatedCost ?? 0;
+      const actCost = activeOp?.actualCost ?? 0;
+      const costStr = estCost > 0 || actCost > 0
+        ? ` | est: $${estCost.toFixed(4)} actual: $${actCost.toFixed(4)}`
+        : "";
 
-    // FR-6.5: Token counts
-    const usage = ctx.getContextUsage();
-    if (usage && usage.tokens !== null) {
-      lines.push(
-        theme.fg("dim", `  context: ${usage.tokens.toLocaleString()} tokens | store: ${formatTokens(index.totalTokens)}`)
-      );
-    } else {
-      lines.push(
-        theme.fg("dim", `  context: unknown | store: ${formatTokens(index.totalTokens)}`)
-      );
-    }
+      const lines = [
+        theme.fg("warning", `RLM: ${displayPhase}`) +
+          theme.fg("muted", ` | depth: ${depth} | children: ${active.length} | budget: ${budget}${costStr}`),
+      ];
 
-    return new Text(lines.join("\n"), 0, 0);
-  });
+      // FR-6.5: Token counts
+      // Note: ctx captured via closure may be from a previous event handler call.
+      // Token counts may be slightly stale between handler calls. This is acceptable
+      // for a status display — exact counts are available via rlm_stats.
+      const usage = ctx.getContextUsage();
+      if (usage && usage.tokens !== null) {
+        lines.push(
+          theme.fg("dim", `  context: ${usage.tokens.toLocaleString()} tokens | store: ${formatTokens(index.totalTokens)}`)
+        );
+      } else {
+        lines.push(
+          theme.fg("dim", `  context: unknown | store: ${formatTokens(index.totalTokens)}`)
+        );
+      }
+
+      return new Text(lines.join("\n"), 0, 0);
+    });
+  }, 200);  // 200ms debounce
 }
+
+// Phase type — "idle" is NOT a Phase value. Idle is represented by
+// activePhases.size === 0. The Phase type only covers active states.
+type Phase = "externalizing" | "searching" | "querying" | "batching"
+           | "synthesizing" | "ingesting";
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M tokens`;
@@ -2094,14 +2484,13 @@ The external store uses a dual-persistence model:
 1. **Disk store** (source of truth): `.pi/rlm/<session-id>/store.jsonl` + `index.json`
 2. **Session entries** (lightweight metadata): `pi.appendEntry("rlm-index", indexSnapshot)`
 
-**Manifest persistence (FR-12.1):** FR-12.1 requires persisting "store index
-snapshot, configuration, current manifest." The manifest is **not** persisted
+**Manifest persistence (FR-12.1):** The manifest is **not** persisted
 separately because it is deterministically reconstructable from the store index
 via `ManifestBuilder.build()`. Persisting it would create a stale-data risk
 (manifest out of sync with index). Instead, the manifest is rebuilt on
-`session_start` after the index is loaded. **FR-12.1 in requirements.md should
-be updated to replace "current manifest" with "store index snapshot and
-configuration (manifest is deterministically rebuilt from the index)."**
+`session_start` after the index is loaded. This is consistent with FR-12.1's
+requirement to persist "store index snapshot and configuration" — the manifest
+is deterministically derived from the index.
 
 On `session_start`:
 1. Check if disk store exists at `.pi/rlm/<session-id>/`
@@ -2140,36 +2529,39 @@ back to allowing compaction.
 FR-1.6 (SHOULD) requires the store to support content over 10MB per session.
 The design handles this through architectural choices:
 
-1. **JSONL + index file:** The `index.json` file provides O(1) lookup by ID
-   (via in-memory `Map`) and O(n) scanning for search without parsing the
-   entire JSONL file. Each `StoreIndexEntry` includes `byteOffset` and
-   `byteLength` for direct `fs.read()` seeks into `store.jsonl`, avoiding
-   full-file reads for `rlm_peek`.
+1. **JSONL + in-memory content:** The store keeps both the index AND content
+   in memory for fast synchronous access. `store.get()` is synchronous —
+   it returns from an in-memory `Map<string, StoreRecord>`. The JSONL file
+   is the persistence layer, written asynchronously via `WriteQueue`. On
+   initialization, the entire JSONL file is read into memory.
 
-2. **Streaming search:** `rlm_search` processes objects one at a time via
-   worker threads, never loading the entire store into memory simultaneously.
-   The 50-match cap (§7.2) bounds memory usage during search.
+2. **Memory budget:** Content IS cached in memory. For stores up to ~50MB
+   (the overwhelming majority of coding sessions), this is simple and fast.
+   Memory usage scales with total content size, not just object count.
+   For truly large stores (>50MB), a future optimization could evict old
+   content to an LRU cache with disk-backed fallback — but this is deferred
+   (not needed for v1).
 
-3. **Index memory pressure:** At 10MB of content (~2,500 tokens/KB × 10MB =
-   ~2.5M tokens), the index holds ~500–2,000 `StoreIndexEntry` objects
-   (assuming average 5–20KB per object). Each entry is ~200 bytes, so the
-   index fits in <1MB of memory. This scales comfortably to 100MB+ stores.
+3. **Worker-thread search:** `rlm_search` passes content strings to worker
+   threads for regex execution. Since content is in memory, no disk I/O is
+   needed. The 50-match cap (§7.2) bounds result size.
 
 4. **Manifest truncation:** The manifest (§3.3) shows only the most recent
    entries within its token budget, collapsing older entries into a summary
    line. Large stores don't produce large manifests.
 
-5. **No in-memory content cache:** Content is stored only on disk (in
-   `store.jsonl`) and read on demand via byte-offset seeks. The in-memory
-   index contains only metadata. This keeps memory usage proportional to
-   object count, not content size.
-
-**Performance targets for 10MB+ stores:**
-- `rlm_peek`: <50ms (single `fs.read` at byte offset)
-- `rlm_search` (substring): <2s (streaming scan with worker threads)
+**Performance targets for 10MB+ stores (aligned with NFR-2):**
+- `rlm_peek`: <10ms (in-memory slice, no disk I/O)
+- `rlm_search` (substring): <500ms for stores up to 10MB (consistent with NFR-2.3)
 - `rlm_search` (regex): <5s per object (worker thread timeout, §7.2)
 - Manifest generation: <10ms (index scan, no disk I/O)
 - Externalization (context handler): <100ms (in-memory index update is sync)
+
+**Note on `StoreIndexEntry.byteOffset` and `byteLength`:** These fields are
+retained in the index schema for crash recovery — if the in-memory content is
+lost (e.g., after Pi restart), the store can rebuild by seeking directly into
+the JSONL file rather than re-parsing every line. They are not used during
+normal operation.
 
 ### 11.4 Store Cleanup (FR-1.8)
 
@@ -2294,18 +2686,28 @@ deliberate deviation for practical reasons:
 
 **Deliverables:**
 1. Extension skeleton (`index.ts`) with event handler wiring + `safeHandler`
-2. `ExternalStore` — JSONL read/write with in-memory index + `WriteQueue`
+2. `ExternalStore` — JSONL read/write with in-memory content + index + `WriteQueue`
 3. `ContextExternalizer` — `context` handler: stub replacement, externalization,
-   manifest injection
-4. `countMessageTokens()` utility
-5. Compaction interceptor — `session_before_compact` returns `{ cancel: true }`
-6. `rlm_peek` — retrieve slice from store
-7. `rlm_search` — substring search (no regex timeout yet)
-8. `ManifestBuilder` — manifest injected into message array
-9. Basic widget — shows off/idle states
-10. `/rlm`, `/rlm on`, `/rlm off`, `/rlm cancel` commands
-11. `disabledGuard()` on all tools
-12. Unit tests for `ExternalStore`, `ManifestBuilder`, `countMessageTokens`
+   manifest injection (merged into first user message)
+4. `countMessageTokens()` and `countMessageTokensSafe()` utilities
+5. Compaction interceptor — `session_before_compact` with `storeHealthy` check
+6. Safety valve (FR-3.8) — force-externalize at 90%, fallback to compaction.
+   This is a MUST requirement protecting against catastrophic context overflow
+   and must be in Phase 1 alongside the compaction interceptor.
+7. `WarmTracker` — dual tracking of object IDs and tool call IDs (FR-3.9)
+8. `rlm_peek` — retrieve slice from store, with warm toolCallId tracking
+9. `rlm_search` — substring search (no regex timeout yet)
+10. `ManifestBuilder` — manifest merged into first user message
+11. Basic widget — shows off/idle states, debounced updates
+12. `/rlm`, `/rlm on`, `/rlm off`, `/rlm cancel` commands
+13. `disabledGuard()` on all tools
+14. `onShutdown` handler — flush store and trajectory
+15. Unit tests for `ExternalStore`, `ManifestBuilder`, `countMessageTokens`,
+    `WarmTracker`, `WriteQueue`, fingerprint
+16. **Validation: concurrent `complete()` calls** — Run 4 parallel `complete()`
+    calls to the same provider and verify all return correct, independent
+    results. This is a go/no-go gate for `rlm_batch` in Phase 2. If this
+    fails, Phase 2 must include a sequential fallback mode.
 
 **Validation:** Run Pi with the extension, have a long conversation, verify
 compaction never fires, verify `rlm_peek` retrieves externalized content,
@@ -2336,20 +2738,19 @@ verify parallel execution. Verify budget cancellation and timeout behavior.
 
 ### Phase 3: Robustness (1 week)
 
-**Goal:** Harden the extension for real-world use. Add safety valves,
-warm tracking, retry logic, and error handling.
+**Goal:** Harden the extension for real-world use. Add retry logic, regex
+timeout, and remaining error handling. (Safety valve and warm tracking were
+moved to Phase 1 as they are MUST requirements.)
 
 **Deliverables:**
-1. Safety valve (FR-3.8) — force-externalize at 90%, fallback to compaction
-2. `WarmTracker` — tracks object IDs, prevents re-externalization
-3. Rate-limit retry with exponential backoff (FR-5.11)
-4. Child response validation and fallback wrapping (FR-5.12)
-5. Regex timeout via `worker_threads` for `rlm_search` (NFR-3.5)
-6. `safeToolExecute` wrapper on all tool executors (NFR-3.1)
-7. Store health tracking (`storeHealthy` flag) + degradation (FR-13)
-8. First-run notification via file flag (FR-14)
-9. `try/finally` on all tool executors for phase reset
-10. Unit tests for `WarmTracker`, regex timeout, retry logic
+1. Rate-limit retry with exponential backoff (FR-5.11)
+2. Child response validation and fallback wrapping (FR-5.12)
+3. Regex timeout via `worker_threads` for `rlm_search` (NFR-3.5) — inline worker code
+4. `safeToolExecute` wrapper on all tool executors (NFR-3.1)
+5. Store health tracking refinements — notify user on degradation (FR-13)
+6. First-run notification via file flag (FR-14)
+7. `try/finally` on all tool executors for phase cleanup
+8. Unit tests for regex timeout, retry logic
 
 **Validation:** Run stress tests — many concurrent `rlm_batch` children,
 rapid externalization/retrieval cycles, large stores, model errors, ReDoS
@@ -2378,10 +2779,12 @@ for general use.
 
 ### 14.1 Test Levels
 
-The testing strategy has three levels. **All three run on every push** — there
-is no "optional" tier. If the model can't use the tools correctly with a real
-LLM, the extension is broken and we need to know immediately, not after a user
-reports it.
+The testing strategy has three levels. Unit and component tests run in CI on
+every push. E2E tests are the developer's responsibility to run locally before
+pushing — they require a configured Pi agent with model providers. There is no
+"optional" tier: if the model can't use the tools correctly with a real LLM,
+the extension is broken. The developer must verify this locally, not defer it
+to CI.
 
 | Level | What it catches | Runs against | Speed |
 |-------|----------------|-------------|-------|
@@ -3547,10 +3950,17 @@ run its E2E scenarios locally and they pass with a real model.**
 
 | Phase | Unit tests | Component tests | E2E scenarios |
 |-------|-----------|----------------|---------------|
-| 1 | store, fingerprint, manifest, tokens, write-queue | externalizer, context-handler, tools-peek, tools-search, commands, compaction-intercept | **long-session**, **cross-turn-retrieval**, **session-resume** |
+| 1 | store, fingerprint, manifest, tokens, write-queue, warm-tracker | externalizer, context-handler, tools-peek, tools-search, commands, compaction-intercept | **long-session**, **cross-turn-retrieval** |
 | 2 | call-tree, concurrency, cost-estimator | tools-query, tools-batch, tools-ingest | **ingest-and-analyze**, **cancel-mid-operation** |
-| 3 | warm-tracker, regex-timeout, retry | (hardening of existing) | **disable-enable**, **no-confabulation** |
-| 4 | — | widget | (all scenarios re-run as regression) |
+| 3 | regex-timeout, retry | (hardening of existing) | **disable-enable**, **no-confabulation** |
+| 4 | — | widget | **session-resume** (requires Phase 4 cross-session mechanism), (all scenarios re-run as regression) |
+
+**Note on session-resume test phasing:** The session-resume E2E test (§14.6
+Scenario 4) uses `--no-session`, which means both Pi instances share the
+`"ephemeral"` session ID and thus the same store path. This tests store
+*persistence* at a fixed path — not FR-12.3's true cross-session resume
+(which requires Phase 4's mechanism to reference a different session's store).
+The test is assigned to Phase 4 where the implementation lives.
 
 ### 14.8 Coverage Targets and CI
 
