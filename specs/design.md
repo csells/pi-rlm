@@ -343,7 +343,7 @@ types (`UserMessage`, `AssistantMessage`, `ToolResultMessage`, and custom
 message types) do **not** have an `id` field. Only `SessionEntry` (the
 session-level wrapper) has `id`, and the `context` event delivers raw
 `AgentMessage[]` without entry wrappers. The design therefore uses a
-**content-based fingerprint** to stably identify messages across turns:
+**fingerprint** to stably identify messages across turns:
 
 ```typescript
 function messageFingerprint(msg: AgentMessage): string {
@@ -351,21 +351,23 @@ function messageFingerprint(msg: AgentMessage): string {
   if ("toolCallId" in msg && msg.role === "toolResult") {
     return `toolResult:${msg.toolCallId}`;
   }
-  // Composite fingerprint: role + timestamp + short content hash
-  // Using both timestamp and content hash protects against same-ms collisions
-  // (e.g., rapid programmatic message creation)
+  // Primary fingerprint: role + timestamp
+  // Pi timestamps are millisecond-precision (Date.now()) and near-unique.
+  // Same-ms collisions are theoretically possible but extremely unlikely
+  // in practice (would require two messages created in <1ms).
+  if ("timestamp" in msg) {
+    return `${msg.role}:${msg.timestamp}`;
+  }
+  // Fallback: should not occur with current Pi types.
+  // If hit during Phase 1 validation, switch to WeakMap<AgentMessage, number>
+  // sequence counter as tiebreaker.
+  console.warn("[pi-rlm] Message without timestamp — fingerprint fallback");
   const contentSnippet = typeof msg.content === "string"
     ? msg.content.slice(0, 200)
     : Array.isArray(msg.content)
       ? msg.content.filter(b => b.type === "text").map(b => b.text).join("").slice(0, 200)
       : "";
-  const contentHash = simpleHash(contentSnippet);
-
-  if ("timestamp" in msg) {
-    return `${msg.role}:${msg.timestamp}:${contentHash}`;
-  }
-  // Fallback: role + content hash only (should not occur with current Pi types)
-  return `${msg.role}:${contentHash}`;
+  return `${msg.role}:fallback:${simpleHash(contentSnippet)}`;
 }
 
 function simpleHash(str: string): string {
@@ -378,11 +380,16 @@ function simpleHash(str: string): string {
 ```
 
 **Why this works:** Every Pi message type includes a `timestamp` field
-(millisecond precision, set via `Date.now()` at creation). The composite
-fingerprint combines `role + timestamp + contentHash` to protect against
-same-millisecond collisions. For `toolResult` messages, `toolCallId` provides
+(millisecond precision, set via `Date.now()` at creation). The fingerprint
+uses `role + timestamp` as the primary key — simple, fast, and sufficient
+given millisecond precision. For `toolResult` messages, `toolCallId` provides
 an even stronger unique identifier. The fingerprint is computed identically
 on every `context` event call, so it's stable across turns.
+
+**Phase 1 validation gate:** During Phase 1, log any message that hits the
+fallback branch (no `timestamp`). If any Pi message types lack timestamps,
+switch to a `WeakMap<AgentMessage, number>` monotonic sequence counter
+assigned in the context handler as the tiebreaker.
 
 **Conversation branching:** Pi supports multi-branch conversations. The
 fingerprint scheme is per-session, not per-branch. When branching occurs:
@@ -772,7 +779,25 @@ async function onContext(event: any, ctx: ExtensionContext) {
       externalize(messages, state, threshold);
     }
 
-    // Phase 2: Safety valve (FR-3.8) — uses chars/3 for conservative estimate
+    // Phase 2: Inject manifest into the first user message's content.
+    // Manifest injection happens BEFORE the safety valve check so that the
+    // safety valve accounts for the manifest's token cost (up to manifestBudget
+    // tokens). Without this ordering, the manifest could push context over the
+    // safety threshold after the check has already passed.
+    // Merged into existing message to preserve user→assistant alternation.
+    if (state.store.getFullIndex().objects.length > 0) {
+      const manifest = state.manifest.build(state.config.manifestBudget);
+      const firstUserIdx = messages.findIndex(m => m.role === "user");
+      if (firstUserIdx >= 0) {
+        const msg = messages[firstUserIdx];
+        if (Array.isArray(msg.content)) {
+          msg.content.unshift({ type: "text", text: manifest + "\n\n---\n\n" });
+        }
+      }
+    }
+
+    // Phase 3: Safety valve (FR-3.8) — uses chars/3 for conservative estimate.
+    // Runs AFTER manifest injection so the manifest's token cost is included.
     const postUsage = countMessageTokensSafe(messages);
     if (postUsage > safetyThreshold) {
       forceExternalize(messages, state);
@@ -781,19 +806,6 @@ async function onContext(event: any, ctx: ExtensionContext) {
       const finalUsage = countMessageTokensSafe(messages);
       if (finalUsage > safetyThreshold) {
         state.allowCompaction = true;
-      }
-    }
-  }
-
-  // Phase 3: Inject manifest into the first user message's content
-  // Merged into existing message to preserve user→assistant alternation.
-  if (state.store.getFullIndex().objects.length > 0) {
-    const manifest = state.manifest.build(state.config.manifestBudget);
-    const firstUserIdx = messages.findIndex(m => m.role === "user");
-    if (firstUserIdx >= 0) {
-      const msg = messages[firstUserIdx];
-      if (Array.isArray(msg.content)) {
-        msg.content.unshift({ type: "text", text: manifest + "\n\n---\n\n" });
       }
     }
   }
@@ -925,40 +937,130 @@ the safe direction.
 
 Called when context usage exceeds `tokenBudgetPercent`.
 
+#### 5.2.0 Atomic ToolCall/ToolResult Pairing
+
+Most LLM APIs (Anthropic Messages API in particular) enforce a strict contract:
+every `ToolResultMessage` must correspond to a `ToolCall` in the preceding
+`AssistantMessage`. Violating this causes a 400 error. Therefore,
+**`AssistantMessage`s containing `ToolCall` blocks and their corresponding
+`ToolResultMessage`s must always be externalized as an atomic unit.**
+
+When considering any message for externalization:
+- If it is an `AssistantMessage` with `ToolCall` content blocks, collect all
+  `ToolResultMessage`s in the array whose `toolCallId` matches any of those
+  tool calls. The entire group (assistant + all results) is externalized or
+  kept together.
+- If it is a `ToolResultMessage`, find the preceding `AssistantMessage` that
+  contains a `ToolCall` with a matching `toolCallId`. That assistant message
+  and *all* of its `ToolResultMessage`s form the atomic group.
+- Plain `AssistantMessage`s (text only, no `ToolCall` blocks) and
+  `UserMessage`s can be externalized individually.
+
+The helper `buildAtomicGroups(messages)` pre-computes these groups:
+
+```typescript
+interface AtomicGroup {
+  messages: AgentMessage[];       // The assistant + its toolResult(s), or a single message
+  fingerprints: string[];         // One per message in the group
+  estimatedTokens: number;        // Sum of token estimates for all messages in group
+}
+
+function buildAtomicGroups(messages: AgentMessage[]): AtomicGroup[] {
+  const groups: AtomicGroup[] = [];
+  const claimed = new Set<number>();  // Indices already in a group
+
+  for (let i = 0; i < messages.length; i++) {
+    if (claimed.has(i)) continue;
+    const msg = messages[i];
+
+    if (msg.role === "assistant" && hasToolCalls(msg)) {
+      // Collect all toolCallIds from this assistant message
+      const toolCallIds = new Set(
+        msg.content.filter(b => b.type === "tool_use").map(b => b.id)
+      );
+      // Find all corresponding ToolResultMessages
+      const group: AgentMessage[] = [msg];
+      claimed.add(i);
+      for (let j = i + 1; j < messages.length; j++) {
+        if (claimed.has(j)) continue;
+        const candidate = messages[j];
+        if (candidate.role === "toolResult" && toolCallIds.has(candidate.toolCallId)) {
+          group.push(candidate);
+          claimed.add(j);
+        }
+      }
+      groups.push({
+        messages: group,
+        fingerprints: group.map(m => messageFingerprint(m)),
+        estimatedTokens: group.reduce((sum, m) => sum + estimateMessageTokens(m), 0),
+      });
+    } else if (msg.role === "toolResult") {
+      // Orphaned toolResult (its assistant was already claimed) — skip,
+      // it will be handled as part of its assistant's group
+      continue;
+    } else {
+      // Standalone message (user, plain assistant)
+      groups.push({
+        messages: [msg],
+        fingerprints: [messageFingerprint(msg)],
+        estimatedTokens: estimateMessageTokens(msg),
+      });
+    }
+  }
+  return groups;
+}
+
+function hasToolCalls(msg: AgentMessage): boolean {
+  return Array.isArray(msg.content) &&
+    msg.content.some(b => b.type === "tool_use");
+}
+```
+
+#### 5.2.1 Externalization Algorithm
+
 ```
 function externalize(messages, state, threshold):
+  groups = buildAtomicGroups(messages)
   candidates = []
-  for each message in messages (oldest first):
-    if message is most recent user message → skip (FR-3.6)
-    if message is most recent assistant message → skip (FR-3.6)
+
+  lastUserIdx = findLastIndex(messages, m => m.role === "user")
+  lastAssistantIdx = findLastIndex(messages, m => m.role === "assistant")
+
+  for each group in groups (oldest first):
+    // Skip if group contains the most recent user or assistant message (FR-3.6)
+    if group.messages includes messages[lastUserIdx] → skip
+    if group.messages includes messages[lastAssistantIdx] → skip
 
     // Warm check 1: RLM tool results are exempt for warmTurns (C5 fix)
     // Any ToolResultMessage from an rlm_* tool is a retrieval result.
     // Re-externalizing it would cause retrieve→externalize→retrieve thrashing.
-    if message.role === "toolResult" and warmTracker.isToolCallWarm(message.toolCallId) → skip
+    if any message in group has role === "toolResult"
+       and warmTracker.isToolCallWarm(message.toolCallId) → skip entire group
 
-    // Warm check 2: look up whether this message's store object is warm
-    fp = messageFingerprint(message)
-    objectId = externalizedMessages.get(fp)
-    if objectId and warmTracker.isWarm(objectId) → skip (FR-3.9)
+    // Warm check 2: look up whether any message in this group's store object is warm
+    if any fingerprint in group.fingerprints maps to a warm objectId → skip (FR-3.9)
 
-    if message has tool results with large output → prioritize (FR-3.5)
-    candidates.push({ message, fingerprint: fp, estimatedTokens })
+    // Skip if any message in group is already a stub
+    if any message in group has content matching stub pattern → skip
+
+    if group contains tool results with large output → prioritize (FR-3.5)
+    candidates.push(group)
 
   sort candidates by estimatedTokens descending (largest first)
 
-  for each candidate:
+  for each candidate group:
     if countMessageTokens(messages) <= threshold → break
 
-    object = store.add({
-      type: inferContentType(candidate.message),
-      description: generateDescription(candidate.message),
-      content: extractContent(candidate.message),
-      source: { kind: "externalized", fingerprint: candidate.fingerprint },
-    })
-
-    externalizedMessages.set(candidate.fingerprint, object.id)
-    replaceWithStub(messages, candidate.message, object)
+    // Externalize each message in the group individually (for granular retrieval)
+    for each (message, fingerprint) in candidate group:
+      object = store.add({
+        type: inferContentType(message),
+        description: generateDescription(message),
+        content: extractContent(message),
+        source: { kind: "externalized", fingerprint: fingerprint },
+      })
+      externalizedMessages.set(fingerprint, object.id)
+      replaceWithStub(messages, message, object)
 ```
 
 **`store.add()` behavior:** Updates in-memory index synchronously (returns
@@ -966,7 +1068,7 @@ function externalize(messages, state, threshold):
 `WriteQueue`. Callers see the object in the index immediately; disk persistence
 is eventual but serialized.
 
-### 5.2.1 WarmTracker Dual-Tracking (FR-3.9 + C5)
+### 5.2.2 WarmTracker Dual-Tracking (FR-3.9 + C5)
 
 The `WarmTracker` tracks two kinds of warm references to prevent
 re-externalization thrashing:
@@ -1026,22 +1128,48 @@ retrieve→externalize→retrieve cycle.
 ### 5.3 Force Externalization (FR-3.8)
 
 Called when context exceeds `safetyValvePercent` after normal externalization.
+Uses the same atomic grouping as normal externalization to preserve the
+toolCall/toolResult contract.
 
 ```
 function forceExternalize(messages, state):
-  for each message in messages:
-    if message is most recent user message → skip
-    if message is most recent assistant message → skip
-    if message is system prompt → skip
+  groups = buildAtomicGroups(messages)
 
-    if not already a stub:
-      fp = messageFingerprint(message)
+  lastUserIdx = findLastIndex(messages, m => m.role === "user")
+  lastAssistantIdx = findLastIndex(messages, m => m.role === "assistant")
+
+  for each group in groups:
+    // Skip if group contains the most recent user or assistant message
+    if group.messages includes messages[lastUserIdx] → skip
+    if group.messages includes messages[lastAssistantIdx] → skip
+    // Skip system prompt
+    if any message in group is system prompt → skip
+
+    for each (message, fingerprint) in group:
+      // Skip messages already externalized (fingerprint already tracked)
+      if externalizedMessages.has(fingerprint) → skip (already a stub in LLM view)
+
+      // Skip messages whose content is already a stub (defensive guard against
+      // re-externalizing stub text, which would create garbage store entries)
+      if isStubContent(message) → skip
+
       object = store.add({
-        ...,
-        source: { kind: "externalized", fingerprint: fp },
+        type: inferContentType(message),
+        description: generateDescription(message),
+        content: extractContent(message),
+        source: { kind: "externalized", fingerprint: fingerprint },
       })
-      externalizedMessages.set(fp, object.id)
+      externalizedMessages.set(fingerprint, object.id)
       replaceWithStub(messages, message, object)
+
+function isStubContent(msg: AgentMessage): boolean {
+  const text = typeof msg.content === "string"
+    ? msg.content
+    : Array.isArray(msg.content)
+      ? msg.content.filter(b => b.type === "text").map(b => b.text).join("")
+      : "";
+  return text.startsWith("[RLM externalized:");
+}
 ```
 
 ### 5.4 Stub Replacement for Already-Externalized Content
