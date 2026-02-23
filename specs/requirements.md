@@ -229,8 +229,9 @@ expressed through tool-call chaining in Pi's agent loop: the model orchestrates
 and `rlm_batch` for parallel map-reduce patterns.
 
 **FR-4.1** [MUST] `rlm_peek` — Retrieve a slice of an externalized object by
-identifier and byte/line offset. Parameters: `id` (string), `offset` (number),
-`length` (number). Returns the requested slice as text.
+identifier and character offset. Parameters: `id` (string), `offset` (number,
+character offset), `length` (number, characters). Returns the requested slice
+as text.
 
 **FR-4.2** [MUST] `rlm_search` — Search across all externalized objects using
 a text pattern (substring or regex). Parameters: `pattern` (string),
@@ -389,7 +390,8 @@ via `pi.registerCommand()`:
 |---------|-------------|
 | `/rlm` | Show RLM status summary (on/off, store size, active operations) |
 | `/rlm on` | Enable RLM mode (default). Externalization, compaction interception, and RLM tools are active. |
-| `/rlm off` | Disable RLM mode. RLM tools are deregistered, compaction interception is removed, Pi reverts to standard behavior. External store is preserved on disk. |
+| `/rlm off` | Disable RLM mode. RLM tools become unavailable (guarded, not deregistered — Pi's extension API does not support dynamic tool deregistration), compaction interception is removed, Pi reverts to standard behavior. External store is preserved on disk. |
+| `/rlm cancel` | Cancel all active recursive operations. Aborts in-flight child calls and returns partial results. RLM remains enabled. |
 
 **FR-8.2** [SHOULD] The extension **should** register additional commands:
 
@@ -416,9 +418,10 @@ mid-flight. Cancellation **must** abort all active child calls via
 
 **FR-9.2** [MUST] RLM processing **must** default to on. The user **must** be
 able to toggle it off (`/rlm off`) and on (`/rlm on`) at any time mid-session.
-When off: compaction interception is removed, RLM tools are unavailable, the
-`context` event handler passes through unchanged, and Pi operates with standard
-compaction. When re-enabled: the extension restores RLM state from the persisted
+When off: compaction interception is removed, RLM tools are guarded (return
+error if called — Pi's extension API does not support dynamic deregistration),
+the `context` event handler passes through unchanged, and Pi operates with
+standard compaction. When re-enabled: the extension restores RLM state from the persisted
 store and resumes externalization. The external store is never deleted by
 toggling off — only the active behavior changes.
 
@@ -496,11 +499,12 @@ can override the default RLM instructions via a configuration file.
 
 ### FR-12: Session Persistence and Resume
 
-**FR-12.1** [MUST] Extension metadata (store index snapshot, configuration,
-current manifest) **must** persist via `pi.appendEntry()` so it can be
-reconstructed after Pi restarts. The on-disk store (FR-1.4) is the source of
-truth for content; `appendEntry` stores lightweight metadata for fast
-reconstruction without re-scanning the store.
+**FR-12.1** [MUST] Extension metadata (store index snapshot and configuration)
+**must** persist via `pi.appendEntry()` so it can be reconstructed after Pi
+restarts. The on-disk store (FR-1.4) is the source of truth for content;
+`appendEntry` stores lightweight metadata for fast reconstruction without
+re-scanning the store. The context manifest is deterministically rebuilt from
+the store index and is not persisted separately.
 
 **FR-12.2** [MUST] On `session_start`, the extension **must** reconstruct its
 in-memory state from persisted session entries and the on-disk store. If
