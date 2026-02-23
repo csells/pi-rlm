@@ -322,11 +322,19 @@ function renderWidget(state: any, theme: any, ctx: any): string {
   if (state.activePhases.size === 0) {
     const index = state.store.getFullIndex();
     const tokens = formatTokens(index.totalTokens);
-    const text =
+    const usage = ctx.getContextUsage();
+    const contextTokens = usage && usage.tokens !== null
+      ? `${usage.tokens.toLocaleString()} tokens`
+      : "unknown";
+
+    const lines = [
       theme.fg("accent", "RLM: on") +
-      theme.fg("muted", ` (${index.objects.length} objects, ${tokens})`) +
-      theme.fg("dim", " | /rlm off to disable");
-    return text;
+        theme.fg("muted", ` (${index.objects.length} objects, ${tokens})`) +
+        theme.fg("dim", " | /rlm off to disable"),
+      theme.fg("dim", `  context: ${contextTokens} | store: ${formatTokens(index.totalTokens)}`),
+    ];
+
+    return lines.join("\n");
   }
 
   const phasePriority = [

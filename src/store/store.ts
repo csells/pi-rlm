@@ -170,6 +170,30 @@ export class ExternalStore {
   }
 
   /**
+   * Clear all in-memory and on-disk store data for this session.
+   */
+  async clear(): Promise<void> {
+    this.records.clear();
+    this.externalizedMap.clear();
+    this.index = {
+      version: 1,
+      sessionId: this.sessionId,
+      objects: [],
+      totalTokens: 0,
+    };
+
+    await this.writeQueue.enqueue("store.clear", async () => {
+      const storePath = path.join(this.storeDir, "store.jsonl");
+      const indexPath = path.join(this.storeDir, "index.json");
+
+      await fs.promises.rm(storePath, { force: true }).catch(() => {});
+      await fs.promises.rm(indexPath, { force: true }).catch(() => {});
+      await fs.promises.mkdir(this.storeDir, { recursive: true });
+      await this.writeIndex();
+    });
+  }
+
+  /**
    * Rebuild the externalized messages map from store records.
    * Called on initialization (§11.2).
    */

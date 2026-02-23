@@ -19,7 +19,7 @@ import { WarmTracker } from "./context/warm-tracker.js";
 import { CallTree } from "./engine/call-tree.js";
 import { CostEstimator } from "./engine/cost.js";
 import { RecursiveEngine } from "./engine/engine.js";
-import { emitEvent, safeHandler } from "./events.js";
+import { emitEvent, safeHandler, safeToolExecute } from "./events.js";
 import { ExternalStore, getRlmStoreDir } from "./store/store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { buildRlmBatchTool } from "./tools/batch.js";
@@ -353,7 +353,7 @@ function registerTools(pi: any, state: RlmState): void {
     label: queryTool.label,
     description: queryTool.description,
     parameters: queryTool.parameters,
-    execute: queryTool.execute,
+    execute: safeToolExecute(queryTool.name, queryTool.execute),
   });
 
   const batchTool = buildRlmBatchTool(
@@ -373,7 +373,7 @@ function registerTools(pi: any, state: RlmState): void {
     label: batchTool.label,
     description: batchTool.description,
     parameters: batchTool.parameters,
-    execute: batchTool.execute,
+    execute: safeToolExecute(batchTool.name, batchTool.execute),
   });
 
   const peekTool = buildRlmPeekTool(state as any);
@@ -383,7 +383,7 @@ function registerTools(pi: any, state: RlmState): void {
     label: peekTool.label,
     description: peekTool.description,
     parameters: peekTool.parameters,
-    execute: peekTool.execute,
+    execute: safeToolExecute(peekTool.name, peekTool.execute),
   });
 
   const searchTool = buildRlmSearchTool(state as any);
@@ -393,7 +393,7 @@ function registerTools(pi: any, state: RlmState): void {
     label: searchTool.label,
     description: searchTool.description,
     parameters: searchTool.parameters,
-    execute: searchTool.execute,
+    execute: safeToolExecute(searchTool.name, searchTool.execute),
   });
 
   const statsTool = buildRlmStatsTool(state as any);
@@ -403,7 +403,7 @@ function registerTools(pi: any, state: RlmState): void {
     label: statsTool.label,
     description: statsTool.description,
     parameters: statsTool.parameters,
-    execute: statsTool.execute,
+    execute: safeToolExecute(statsTool.name, statsTool.execute),
   });
 
   const ingestTool = buildRlmIngestTool(state as any);
@@ -413,7 +413,7 @@ function registerTools(pi: any, state: RlmState): void {
     label: ingestTool.label,
     description: ingestTool.description,
     parameters: ingestTool.parameters,
-    execute: ingestTool.execute,
+    execute: safeToolExecute(ingestTool.name, ingestTool.execute),
   });
 }
 

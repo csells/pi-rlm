@@ -85,6 +85,7 @@ export interface IExternalStore {
   findByIngestPath(path: string): string | null;
   initialize(): Promise<void>;
   flush(): Promise<void>;
+  clear?(): Promise<void>;
   rebuildExternalizedMap(): void;
 }
 
@@ -125,6 +126,7 @@ export type TrajectoryRecord = CallTrajectoryRecord | OperationTrajectoryRecord;
 export interface ITrajectoryLogger {
   append(record: TrajectoryRecord): void;
   flush(): Promise<void>;
+  getTrajectoryPath?(): string;
 }
 
 // ============================================================================

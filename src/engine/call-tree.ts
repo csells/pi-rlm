@@ -178,10 +178,15 @@ export class CallTree {
    * Get the most recent active operation.
    */
   getActiveOperation(): OperationEntry | undefined {
+    let latest: OperationEntry | undefined;
+
     for (const op of this.operations.values()) {
-      return op; // First (most recent) entry
+      if (!latest || op.startTime >= latest.startTime) {
+        latest = op;
+      }
     }
-    return undefined;
+
+    return latest;
   }
 
   /**

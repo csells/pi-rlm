@@ -78,6 +78,7 @@ export class CostEstimator {
   ): number {
     // model.cost rates are in $/Mtok
     const cost = (tokensIn * model.cost.input) / 1_000_000 + (tokensOut * model.cost.output) / 1_000_000;
-    return cost;
+    // Normalize float noise for deterministic assertions/logging.
+    return Number(cost.toFixed(10));
   }
 }

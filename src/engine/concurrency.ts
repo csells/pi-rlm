@@ -5,52 +5,37 @@
 
 export class ConcurrencyLimiter {
   private concurrency: number;
-  private running = 0;
-  private queue: Array<() => Promise<void>> = [];
 
   constructor(concurrency: number = 4) {
-    this.concurrency = concurrency;
+    this.concurrency = Math.max(1, Math.floor(concurrency));
   }
 
   /**
    * Map over an array with concurrency limit.
-   * Similar to Promise.all but with a bounded queue.
+   * Similar to Promise.all but with a bounded worker pool.
    */
-  async map<T, R>(
-    items: T[],
-    fn: (item: T) => Promise<R>,
-  ): Promise<R[]> {
-    const results: R[] = [];
-    let index = 0;
+  async map<T, R>(items: T[], fn: (item: T) => Promise<R>): Promise<R[]> {
+    if (items.length === 0) {
+      return [];
+    }
 
-    return new Promise((resolve, reject) => {
-      const process = async () => {
-        if (index >= items.length) {
-          if (this.running === 0) {
-            resolve(results);
-          }
+    const results = new Array<R>(items.length);
+    let nextIndex = 0;
+
+    const worker = async () => {
+      while (true) {
+        const current = nextIndex++;
+        if (current >= items.length) {
           return;
         }
 
-        this.running++;
-        const currentIndex = index++;
-
-        try {
-          const result = await fn(items[currentIndex]);
-          results[currentIndex] = result;
-        } catch (err) {
-          reject(err);
-          return;
-        }
-
-        this.running--;
-        process();
-      };
-
-      // Start with up to `concurrency` workers
-      for (let i = 0; i < this.concurrency && i < items.length; i++) {
-        process();
+        results[current] = await fn(items[current]!);
       }
-    });
+    };
+
+    const workerCount = Math.min(this.concurrency, items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    return results;
   }
 }

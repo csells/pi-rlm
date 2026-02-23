@@ -60,12 +60,19 @@ function renderWidgetText(state: WidgetState, ctx: ExtensionContext, theme: any)
   const index = state.store.getFullIndex();
 
   if (state.activePhases.size === 0) {
-    const tokens = formatTokens(index.totalTokens);
-    return (
+    const usage = ctx.getContextUsage();
+    const contextTokens = usage && usage.tokens !== null
+      ? `${usage.tokens.toLocaleString()} tokens`
+      : "unknown";
+
+    const lines = [
       theme.fg("accent", "RLM: on") +
-      theme.fg("muted", ` (${index.objects.length} objects, ${tokens})`) +
-      theme.fg("dim", " | /rlm off to disable")
-    );
+        theme.fg("muted", ` (${index.objects.length} objects, ${formatTokens(index.totalTokens)})`) +
+        theme.fg("dim", " | /rlm off to disable"),
+      theme.fg("dim", `  context: ${contextTokens} | store: ${formatTokens(index.totalTokens)}`),
+    ];
+
+    return lines.join("\n");
   }
 
   const displayPhase =

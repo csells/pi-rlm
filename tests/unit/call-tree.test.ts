@@ -2,7 +2,7 @@
  * Unit tests for CallTree per §14.4 of the design spec.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { CallTree, CallNode } from "../../src/engine/call-tree.js";
 
 describe("CallTree", () => {
@@ -159,14 +159,13 @@ describe("CallTree", () => {
   describe("abortOperation", () => {
     it("should abort a single operation", () => {
       const controller = callTree.registerOperation("op-1", 0.01);
-      const spy = expect.unreachable;
+      const onAbort = vi.fn();
 
-      controller.signal.addEventListener("abort", () => {
-        spy();
-      });
+      controller.signal.addEventListener("abort", onAbort);
 
       callTree.abortOperation("op-1");
       expect(controller.signal.aborted).toBe(true);
+      expect(onAbort).toHaveBeenCalledTimes(1);
     });
   });
 

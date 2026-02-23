@@ -3,15 +3,18 @@
  * Covers §8 command set: status, on/off/cancel, config, externalize, store, inspect.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { DEFAULT_CONFIG, mergeConfig } from "./config.js";
 import { showInspector } from "./ui/inspector.js";
 import type { CallTree } from "./engine/call-tree.js";
-import type { ExtensionContext, IExternalStore, RlmConfig } from "./types.js";
+import type { ExtensionContext, IExternalStore, ITrajectoryLogger, RlmConfig } from "./types.js";
 
 interface RlmCommandState {
   enabled: boolean;
   config: RlmConfig;
   store: IExternalStore;
+  trajectory?: Pick<ITrajectoryLogger, "getTrajectoryPath">;
   callTree: Pick<
     CallTree,
     | "abortAll"
@@ -30,7 +33,7 @@ interface RlmCommandState {
 export function registerCommands(pi: any, state: RlmCommandState): void {
   pi.registerCommand("rlm", {
     description:
-      "RLM status and control. Usage: /rlm [on|off|cancel|config|inspect|externalize|store]",
+      "RLM status and control. Usage: /rlm [on|off|cancel|config|inspect|externalize|store|trace|clear]",
     handler: async (args: string | undefined, ctx: ExtensionContext) => {
       const subcommand = args?.trim() ?? "";
       const [cmd = "", ...rest] = subcommand.split(/\s+/);
@@ -61,6 +64,12 @@ export function registerCommands(pi: any, state: RlmCommandState): void {
           return;
         case "store":
           showStore(state, ctx);
+          return;
+        case "trace":
+          await showTrace(state, ctx);
+          return;
+        case "clear":
+          await clearStore(state, ctx);
           return;
         default:
           notify(ctx, "Unknown /rlm subcommand. Try /rlm for status.", "warning");
@@ -238,6 +247,58 @@ function showStore(state: RlmCommandState, ctx: ExtensionContext): void {
   }
 
   notify(ctx, lines.join("\n"), "info");
+}
+
+async function showTrace(state: RlmCommandState, ctx: ExtensionContext): Promise<void> {
+  const trajectoryPath = state.trajectory?.getTrajectoryPath?.();
+
+  if (!trajectoryPath) {
+    notify(ctx, "Trajectory path unavailable.", "warning");
+    return;
+  }
+
+  try {
+    const data = await fs.promises.readFile(trajectoryPath, "utf8");
+    const lines = data.split("\n").filter((line) => line.trim().length > 0);
+    const tail = lines.slice(-20);
+
+    if (tail.length === 0) {
+      notify(ctx, `Trajectory is empty: ${trajectoryPath}`, "info");
+      return;
+    }
+
+    notify(
+      ctx,
+      `Trajectory (${tail.length}/${lines.length} recent lines):\n${tail.join("\n")}`,
+      "info",
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    notify(ctx, `Failed reading trajectory: ${message}`, "error");
+  }
+}
+
+async function clearStore(state: RlmCommandState, ctx: ExtensionContext): Promise<void> {
+  try {
+    if (typeof (state.store as any).clear === "function") {
+      await (state.store as any).clear();
+    } else {
+      notify(ctx, "Store clear() not supported by this backend.", "warning");
+      return;
+    }
+
+    const trajectoryPath = state.trajectory?.getTrajectoryPath?.();
+    if (trajectoryPath) {
+      await fs.promises.mkdir(path.dirname(trajectoryPath), { recursive: true });
+      await fs.promises.writeFile(trajectoryPath, "");
+    }
+
+    state.updateWidget(ctx);
+    notify(ctx, "Cleared RLM store and trajectory for current session.", "success");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    notify(ctx, `Failed to clear store: ${message}`, "error");
+  }
 }
 
 function showStatus(state: RlmCommandState, ctx: ExtensionContext): void {
