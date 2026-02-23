@@ -171,12 +171,16 @@ function sleep(ms: number): Promise<void> {
 /**
  * Run a child agent loop with tool support.
  * Per §6.5 of the design spec.
+ * 
+ * NOTE: This function requires `complete()` from @mariozechner/pi-ai to be available
+ * in the calling scope. Since pi-ai types aren't directly imported to avoid circular
+ * dependencies, we use dynamic typing (any) for the complete() function signature.
  */
 async function runChildAgentLoop(
   model: Model,
   context: {
     systemPrompt: string;
-    messages: Message[];
+    messages: any[]; // Message[] from pi-ai
     tools: unknown[];
   },
   signal: AbortSignal,
@@ -184,10 +188,172 @@ async function runChildAgentLoop(
   toolHandlers: Map<string, ToolHandler>,
   maxTurns: number = 5,
 ): Promise<string> {
-  // For now, we return a placeholder. This requires full pi-ai integration
-  // which will be added when task-1 provides the complete() function.
-  console.warn("[pi-rlm] Child agent loop not yet implemented — requires pi-ai complete()");
-  return '{"answer": "Child agent loop placeholder", "confidence": "low", "evidence": []}';
+  // Import complete() dynamically to avoid compile-time dependency on pi-ai
+  // In production, pi-ai must be installed and available
+  let complete: any;
+  try {
+    const module = await import("@mariozechner/pi-ai");
+    complete = module.complete;
+  } catch (err) {
+    console.error("[pi-rlm] Could not load pi-ai module — complete() unavailable");
+    return '{"answer": "Error: pi-ai not available", "confidence": "low", "evidence": []}';
+  }
+
+  let messages = [...context.messages];
+  let turns = 0;
+
+  while (turns < maxTurns) {
+    if (signal.aborted) {
+      return '{"answer": "Aborted by user", "confidence": "low", "evidence": []}';
+    }
+
+    try {
+      // Call complete() with system prompt, messages, and tools
+      const response: any = await complete(
+        model,
+        {
+          systemPrompt: context.systemPrompt,
+          messages,
+          tools: context.tools,
+        },
+        { signal, maxTokens },
+      );
+
+      // Extract text and tool calls from response.content array
+      const textParts = response.content?.filter((c: any) => c.type === "text") ?? [];
+      const toolCalls = response.content?.filter((c: any) => c.type === "toolCall") ?? [];
+
+      // If no tool calls, return the text response
+      if (toolCalls.length === 0) {
+        return textParts.map((c: any) => c.text).join("");
+      }
+
+      // Add the assistant message to messages
+      messages.push(response);
+
+      // Execute tool calls and collect results
+      for (const toolCall of toolCalls) {
+        const handler = toolHandlers.get(toolCall.name);
+        let resultText: string;
+        let isError: boolean;
+
+        if (handler) {
+          try {
+            resultText = await handler(toolCall.arguments);
+            isError = false;
+          } catch (err) {
+            resultText = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+            isError = true;
+          }
+        } else {
+          // Unknown tool — return error to maintain tool-call/tool-result contract
+          resultText = `Unknown tool: ${toolCall.name}. Available tools: ${[...toolHandlers.keys()].join(", ")}`;
+          isError = true;
+        }
+
+        // Add tool result message
+        messages.push({
+          role: "toolResult",
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          content: [{ type: "text", text: resultText }],
+          isError,
+          timestamp: Date.now(),
+        });
+      }
+
+      turns++;
+    } catch (err) {
+      if (signal.aborted) {
+        return '{"answer": "Aborted by user", "confidence": "low", "evidence": []}';
+      }
+      // Re-throw to be caught by query() for rate limit handling
+      throw err;
+    }
+  }
+
+  // Max turns reached — extract text from last assistant message
+  const lastAssistant = [...messages].reverse().find((m: any) => m.role === "assistant");
+  if (lastAssistant?.content) {
+    const text = lastAssistant.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("");
+    if (text) return text;
+  }
+
+  return '{"answer": "Max turns reached without completion", "confidence": "low", "evidence": []}';
+}
+
+/**
+ * Build child tool definitions (schemas) for the Pi tool call API.
+ * These definitions are passed to complete() to enable tool calling.
+ */
+function buildChildToolDefinitions(
+  toolHandlers: Map<string, ToolHandler>,
+): unknown[] {
+  const tools: any[] = [];
+
+  // rlm_peek tool definition
+  if (toolHandlers.has("rlm_peek")) {
+    tools.push({
+      name: "rlm_peek",
+      description: "Retrieve a slice of externalized content by character offset",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Object ID" },
+          offset: { type: "number", description: "Character offset (default 0)" },
+          length: { type: "number", description: "Number of characters (default 2000)" },
+        },
+        required: ["id"],
+      },
+    });
+  }
+
+  // rlm_search tool definition
+  if (toolHandlers.has("rlm_search")) {
+    tools.push({
+      name: "rlm_search",
+      description: "Search externalized objects by pattern",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Search pattern (substring or regex)" },
+          scope: {
+            type: "array",
+            items: { type: "string" },
+            description: "Object IDs to search (default: all)",
+          },
+        },
+        required: ["pattern"],
+      },
+    });
+  }
+
+  // rlm_query tool definition (only if recursion is enabled)
+  if (toolHandlers.has("rlm_query")) {
+    tools.push({
+      name: "rlm_query",
+      description: "Spawn a recursive child LLM call on specific objects",
+      parameters: {
+        type: "object",
+        properties: {
+          instructions: { type: "string", description: "Analysis task" },
+          target: {
+            oneOf: [
+              { type: "string", description: "Single object ID" },
+              { type: "array", items: { type: "string" }, description: "Array of object IDs" },
+            ],
+          },
+          model: { type: "string", description: "Override child model" },
+        },
+        required: ["instructions", "target"],
+      },
+    });
+  }
+
+  return tools;
 }
 
 /**
@@ -357,6 +523,9 @@ export class RecursiveEngine {
       this.config,
     );
 
+    // Build tool definitions for the child context (only if depth < maxDepth)
+    const tools = depth < this.config.maxDepth ? buildChildToolDefinitions(toolHandlers) : [];
+
     // 8. Create child abort controller with timeout
     const childController = new AbortController();
     const childTimeout = setTimeout(() => childController.abort(), this.config.childTimeoutSec * 1000);
@@ -369,10 +538,10 @@ export class RecursiveEngine {
     let status: "success" | "error" | "timeout" | "cancelled" = "success";
 
     try {
-      // For MVP, we'll use a placeholder. Full implementation requires pi-ai integration.
+      // Run the child agent loop with tool support
       const responseText = await runChildAgentLoop(
         childModel,
-        { systemPrompt, messages, tools: [] },
+        { systemPrompt, messages, tools },
         childController.signal,
         this.config.childMaxTokens,
         toolHandlers,

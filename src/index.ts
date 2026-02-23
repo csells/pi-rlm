@@ -238,5 +238,17 @@ function setupWidget(pi: any, state: RlmState): void {
 // Exports
 // ============================================================================
 
-export { CallTree, CostEstimator, RecursiveEngine, resolveChildModel } from "./engine/index.js";
+export {
+  CallTree,
+  CallNode,
+  OperationEntry,
+  ConcurrencyLimiter,
+  CostEstimator,
+  RecursiveEngine,
+  resolveChildModel,
+  isRateLimitError,
+} from "./engine/index.js";
 export * from "./types.js";
+export { DEFAULT_CONFIG, mergeConfig } from "./config.js";
+export { buildRlmQueryTool } from "./tools/query.js";
+export { buildRlmBatchTool } from "./tools/batch.js";

@@ -3,20 +3,7 @@
  * Per §6.7 of the design.
  */
 
-// Minimal types to avoid circular dependencies. Real type comes from pi-ai.
-export interface Model {
-  id: string;
-  label: string;
-  cost: {
-    input: number; // $/Mtok (dollars per million tokens)
-    output: number; // $/Mtok
-  };
-}
-
-export interface StoreIndexEntry {
-  id: string;
-  tokenEstimate: number;
-}
+import { Model, StoreIndexEntry } from "../types.js";
 
 // Overhead per child call: system prompt (~600 tokens) + tool definitions (~300 tokens each)
 const CHILD_OVERHEAD_TOKENS = 1000;
