@@ -1,17 +1,24 @@
 /**
- * Context Externalizer: Fingerprinting, message analysis, and atomic grouping.
+ * Context Externalizer: Fingerprinting, message analysis, and context handlers.
  *
- * Per §3.1 and §5.2.0 of the design spec, this module provides:
- * 1. messageFingerprint() — stable identity for messages via role+timestamp or toolCallId
- * 2. simpleHash() — fast string hashing for fallback fingerprinting
- * 3. isStubContent() — detect if message is already a stub
- * 4. inferContentType() — classify message content
- * 5. generateDescription() — create concise message descriptions
- * 6. extractContent() — extract raw content from messages
- * 7. buildAtomicGroups() — group assistant+toolResult messages for atomic externalization
- * 8. hasToolCalls() — check if assistant message contains tool calls
- * 9. externalizedMessages — Map<fingerprint, objectId> for tracking externalized content
+ * Per §3 and §5 of the design spec, this module provides:
+ * - Message fingerprinting and helper analysis utilities
+ * - Atomic tool-call/tool-result grouping
+ * - Externalization + force-externalization algorithms
+ * - Stub replacement for already externalized messages
+ * - context and session_before_compact handlers
  */
+
+import { emitEvent } from "../events.js";
+import type {
+  ExtensionContext,
+  IExternalStore,
+  ITrajectoryLogger,
+  IWarmTracker,
+  RlmConfig,
+} from "../types.js";
+import { countMessageTokens, countMessageTokensSafe } from "./tokens.js";
+import type { ManifestBuilder } from "./manifest.js";
 
 // ============================================================================
 // Types (matching Pi's message schema)
@@ -19,7 +26,15 @@
 
 export interface AgentMessage {
   role: "user" | "assistant" | "toolResult" | "system";
-  content: string | Array<{ type: string; text?: string; id?: string; name?: string; arguments?: Record<string, unknown> }>;
+  content:
+    | string
+    | Array<{
+        type: string;
+        text?: string;
+        id?: string;
+        name?: string;
+        arguments?: Record<string, unknown>;
+      }>;
   timestamp?: number;
   toolCallId?: string;
   toolName?: string;
@@ -32,6 +47,32 @@ export interface AtomicGroup {
   estimatedTokens: number;
 }
 
+interface StubEntry {
+  id: string;
+  type: string;
+  tokenEstimate: number;
+  description: string;
+}
+
+/**
+ * State required by context/compaction handlers.
+ * This is implemented by index.ts RlmState.
+ */
+export interface ExternalizerState {
+  enabled: boolean;
+  config: RlmConfig;
+  store: IExternalStore;
+  manifest: ManifestBuilder;
+  warmTracker: IWarmTracker;
+  activePhases: Set<string>;
+  turnCount: number;
+  storeHealthy: boolean;
+  allowCompaction: boolean;
+  forceExternalizeOnNextTurn: boolean;
+  trajectory?: ITrajectoryLogger;
+  updateWidget?: (ctx: ExtensionContext) => void;
+}
+
 // ============================================================================
 // Fingerprinting
 // ============================================================================
@@ -40,43 +81,36 @@ export interface AtomicGroup {
  * Compute a stable fingerprint for an AgentMessage.
  *
  * Per §3.1, the fingerprint is:
- * - For ToolResultMessage: "toolResult:<toolCallId>" (unique per tool invocation)
- * - For other messages: "<role>:<timestamp>" (millisecond precision, near-unique)
- * - Fallback (should not occur): "<role>:fallback:<hash>" with console.warn
- *
- * The fingerprint is stable across turns and used to track message identity
- * for externalization mapping.
+ * - For ToolResultMessage: "toolResult:<toolCallId>"
+ * - For other messages: "<role>:<timestamp>"
+ * - Fallback: "<role>:fallback:<hash>"
  */
 export function messageFingerprint(msg: AgentMessage): string {
-  // ToolResultMessage: toolCallId is unique per tool invocation
   if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
     return `toolResult:${msg.toolCallId}`;
   }
 
-  // Primary fingerprint: role + timestamp
-  // Pi timestamps are millisecond-precision (Date.now()) and near-unique.
   if (typeof msg.timestamp === "number") {
     return `${msg.role}:${msg.timestamp}`;
   }
 
-  // Fallback: should not occur with current Pi types.
-  // If hit during validation, switch to WeakMap<AgentMessage, number> sequence counter.
   console.warn("[pi-rlm] Message without timestamp — fingerprint fallback");
-  const contentSnippet = typeof msg.content === "string"
-    ? msg.content.slice(0, 200)
-    : Array.isArray(msg.content)
-      ? msg.content
-          .filter((b) => b.type === "text")
-          .map((b) => b.text)
-          .join("")
-          .slice(0, 200)
-      : "";
+  const contentSnippet =
+    typeof msg.content === "string"
+      ? msg.content.slice(0, 200)
+      : Array.isArray(msg.content)
+        ? msg.content
+            .filter((b) => b.type === "text")
+            .map((b) => b.text)
+            .join("")
+            .slice(0, 200)
+        : "";
+
   return `${msg.role}:fallback:${simpleHash(contentSnippet)}`;
 }
 
 /**
- * Simple 32-bit hash function for fallback fingerprinting.
- * Fast, deterministic, and sufficient for generating unique fallback IDs.
+ * Simple 32-bit hash for fallback fingerprinting.
  */
 export function simpleHash(str: string): string {
   let hash = 0;
@@ -91,9 +125,7 @@ export function simpleHash(str: string): string {
 // ============================================================================
 
 /**
- * Detect if message content is already a stub (to prevent re-externalization).
- *
- * Stubs have the format: "[RLM externalized: <objectId> | <type> | <tokens> | <description>]"
+ * Detect whether content is already an RLM stub.
  */
 export function isStubContent(msg: AgentMessage): boolean {
   const text =
@@ -105,65 +137,53 @@ export function isStubContent(msg: AgentMessage): boolean {
             .map((b) => b.text)
             .join("")
         : "";
+
   return text.startsWith("[RLM externalized:");
 }
 
 /**
- * Infer the content type of a message for store classification.
- *
- * Per §5.5, classification strategy:
- * - ToolResultMessage → "tool_output" (unless from rlm_ingest, then "file")
- * - AssistantMessage → "conversation"
- * - UserMessage → "conversation"
- * - SystemMessage → "conversation"
+ * Infer store content type for a message.
  */
-export function inferContentType(msg: AgentMessage): "conversation" | "tool_output" | "file" | "artifact" {
+export function inferContentType(
+  msg: AgentMessage,
+): "conversation" | "tool_output" | "file" | "artifact" {
   if (msg.role === "toolResult") {
-    // Tool outputs are categorized as tool_output by default.
-    // rlm_ingest results represent file content ingestion and are treated as file records.
     if (msg.toolName === "rlm_ingest") {
       return "file";
     }
     return "tool_output";
   }
-  // User, assistant, and system messages are conversations.
   return "conversation";
 }
 
 /**
- * Generate a concise human-readable description for a message.
- *
- * Per §5.5, strategy:
- * - ToolResultMessage: "<toolName>: <first 80 chars of output>"
- * - AssistantMessage: "Assistant: <first 80 chars of text content>"
- * - UserMessage: "User: <first 80 chars of text>"
- * - SystemMessage: "System: <first 80 chars>"
- * - Fallback: "<role>: <snippet>"
- *
- * Max length: ~100 chars (for manifest display).
+ * Generate concise manifest description for a message.
  */
 export function generateDescription(msg: AgentMessage): string {
   const maxLen = 80;
 
-  // Extract text content
   let text = "";
   if (typeof msg.content === "string") {
     text = msg.content;
   } else if (Array.isArray(msg.content)) {
-    const textBlocks = msg.content.filter((b) => b.type === "text");
-    text = textBlocks.map((b) => b.text).join(" ");
+    text = msg.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join(" ");
   }
 
   const snippet = text.slice(0, maxLen).replace(/\n/g, " ");
 
   if (msg.role === "toolResult") {
-    const toolName = msg.toolName || "tool";
-    return `${toolName}: ${snippet}`;
-  } else if (msg.role === "assistant") {
+    return `${msg.toolName || "tool"}: ${snippet}`;
+  }
+  if (msg.role === "assistant") {
     return `Assistant: ${snippet}`;
-  } else if (msg.role === "user") {
+  }
+  if (msg.role === "user") {
     return `User: ${snippet}`;
-  } else if (msg.role === "system") {
+  }
+  if (msg.role === "system") {
     return `System: ${snippet}`;
   }
 
@@ -172,9 +192,6 @@ export function generateDescription(msg: AgentMessage): string {
 
 /**
  * Extract raw text content from a message.
- *
- * Handles both string content (direct) and array of blocks (filter text blocks).
- * Used for storing content in the external store.
  */
 export function extractContent(msg: AgentMessage): string {
   if (typeof msg.content === "string") {
@@ -182,12 +199,11 @@ export function extractContent(msg: AgentMessage): string {
   }
 
   if (Array.isArray(msg.content)) {
-    // Filter to text blocks and concatenate
-    const textParts = msg.content
+    return msg.content
       .filter((b) => b.type === "text")
       .map((b) => b.text)
-      .filter((t): t is string => t !== undefined);
-    return textParts.join("\n");
+      .filter((t): t is string => typeof t === "string")
+      .join("\n");
   }
 
   return "";
@@ -198,28 +214,14 @@ export function extractContent(msg: AgentMessage): string {
 // ============================================================================
 
 /**
- * Check if an assistant message contains tool calls.
- *
- * Per §5.2.0, an assistant message with tool calls is grouped with its
- * corresponding ToolResultMessages for atomic externalization.
+ * Detect assistant messages that contain tool calls.
  */
 export function hasToolCalls(msg: AgentMessage): boolean {
-  return (
-    Array.isArray(msg.content) &&
-    msg.content.some((b) => b.type === "tool_use")
-  );
+  return Array.isArray(msg.content) && msg.content.some((b) => b.type === "tool_use");
 }
 
 /**
- * Pre-compute atomic groups from a message array.
- *
- * Per §5.2.0, atomic groups are:
- * 1. AssistantMessage with ToolCalls + all corresponding ToolResultMessages
- * 2. Orphaned ToolResultMessages are skipped defensively
- * 3. Plain User/Assistant/System messages (individually)
- *
- * This ensures that tool invocations and results are externalized together,
- * preserving the toolCall/toolResult contract.
+ * Build atomic groups so assistant tool_call + tool_result are externalized together.
  */
 export function buildAtomicGroups(messages: AgentMessage[]): AtomicGroup[] {
   const groups: AtomicGroup[] = [];
@@ -227,10 +229,10 @@ export function buildAtomicGroups(messages: AgentMessage[]): AtomicGroup[] {
 
   for (let i = 0; i < messages.length; i++) {
     if (claimed.has(i)) continue;
+
     const msg = messages[i];
 
     if (msg.role === "assistant" && hasToolCalls(msg)) {
-      // Collect all toolCallIds from this assistant message
       const toolCallIds = new Set<string>();
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
@@ -240,12 +242,12 @@ export function buildAtomicGroups(messages: AgentMessage[]): AtomicGroup[] {
         }
       }
 
-      // Find all corresponding ToolResultMessages
       const group: AgentMessage[] = [msg];
       claimed.add(i);
 
       for (let j = i + 1; j < messages.length; j++) {
         if (claimed.has(j)) continue;
+
         const candidate = messages[j];
         if (
           candidate.role === "toolResult" &&
@@ -260,35 +262,28 @@ export function buildAtomicGroups(messages: AgentMessage[]): AtomicGroup[] {
       groups.push({
         messages: group,
         fingerprints: group.map((m) => messageFingerprint(m)),
-        estimatedTokens: group.reduce(
-          (sum, m) => sum + estimateMessageTokens(m),
-          0
-        ),
+        estimatedTokens: group.reduce((sum, m) => sum + estimateMessageTokens(m), 0),
       });
-    } else if (msg.role === "toolResult") {
-      // Orphaned toolResult (its assistant was already claimed) — skip.
-      // It will be handled as part of its assistant's group.
       continue;
-    } else {
-      // Standalone message (user, plain assistant, system)
-      groups.push({
-        messages: [msg],
-        fingerprints: [messageFingerprint(msg)],
-        estimatedTokens: estimateMessageTokens(msg),
-      });
     }
+
+    if (msg.role === "toolResult") {
+      // Orphaned result — skip defensively.
+      continue;
+    }
+
+    groups.push({
+      messages: [msg],
+      fingerprints: [messageFingerprint(msg)],
+      estimatedTokens: estimateMessageTokens(msg),
+    });
   }
 
   return groups;
 }
 
-/**
- * Estimate token count for a message (chars / 4).
- * Used for token budgeting during externalization.
- */
 function estimateMessageTokens(msg: AgentMessage): number {
-  const content = extractContent(msg);
-  return Math.ceil(content.length / 4);
+  return Math.ceil(extractContent(msg).length / 4);
 }
 
 // ============================================================================
@@ -296,35 +291,400 @@ function estimateMessageTokens(msg: AgentMessage): number {
 // ============================================================================
 
 /**
- * In-memory map of externalized messages.
- *
- * Maps fingerprint → storeObjectId for messages that have been externalized.
- * Used to replace previously-externalized content with stubs on subsequent turns.
- * Rebuilt from store on session start via store.rebuildExternalizedMap().
- *
- * Per §5.4, lookups use messageFingerprint() for stable identity across turns.
+ * fingerprint -> objectId map for content externalized in this/previous turns.
  */
 export const externalizedMessages = new Map<string, string>();
 
 /**
- * Rebuild the externalized messages map from the store.
- *
- * Called on session start (§4.2, step 4). Iterates all store records with
- * source.kind === "externalized" and populates externalizedMessages from
- * source.fingerprint → record.id.
- *
- * @param storeRecords - All records from the store
+ * Rebuild externalizedMessages from persisted records.
  */
 export function rebuildExternalizedMap(
-  storeRecords: Array<{ id: string; source: { kind: string; fingerprint?: string } }>
+  storeRecords: Array<{ id: string; source: { kind: string; fingerprint?: string } }>,
 ): void {
   externalizedMessages.clear();
   for (const record of storeRecords) {
-    if (
-      record.source.kind === "externalized" &&
-      record.source.fingerprint
-    ) {
+    if (record.source.kind === "externalized" && record.source.fingerprint) {
       externalizedMessages.set(record.source.fingerprint, record.id);
     }
   }
+}
+
+/**
+ * Rebuild externalizedMessages directly from the store interface.
+ */
+export function rebuildExternalizedMessagesFromStore(store: IExternalStore): void {
+  const records: Array<{ id: string; source: { kind: string; fingerprint?: string } }> = [];
+
+  for (const id of store.getAllIds()) {
+    const rec = store.get(id);
+    if (!rec) continue;
+
+    if (rec.source.kind === "externalized") {
+      records.push({
+        id: rec.id,
+        source: { kind: "externalized", fingerprint: rec.source.fingerprint },
+      });
+    } else {
+      records.push({ id: rec.id, source: { kind: rec.source.kind } });
+    }
+  }
+
+  rebuildExternalizedMap(records);
+}
+
+// ============================================================================
+// Stub Replacement
+// ============================================================================
+
+function buildStubText(entry: StubEntry): string {
+  return [
+    `[RLM externalized: ${entry.id} | ${entry.type} | ${entry.tokenEstimate.toLocaleString()} tokens | ${entry.description}]`,
+    `Use rlm_peek("${entry.id}") to view, or rlm_search to find specific content.`,
+  ].join("\n");
+}
+
+/**
+ * Replace a message's content with an RLM stub.
+ *
+ * For assistant messages that originally contain tool_use blocks, preserve the
+ * tool_use blocks to keep tool_call/tool_result contracts valid.
+ */
+export function replaceContentWithStub(msg: AgentMessage, entry: StubEntry): void {
+  const stubText = buildStubText(entry);
+
+  if (
+    msg.role === "assistant" &&
+    Array.isArray(msg.content) &&
+    msg.content.some((b) => b.type === "tool_use")
+  ) {
+    const toolBlocks = msg.content.filter((b) => b.type === "tool_use");
+    msg.content = [{ type: "text", text: stubText }, ...toolBlocks];
+    return;
+  }
+
+  msg.content = [{ type: "text", text: stubText }];
+}
+
+/**
+ * Replace all messages that have known externalized fingerprints with stubs.
+ */
+export function replaceExternalizedWithStubs(messages: AgentMessage[], store: IExternalStore): void {
+  for (const msg of messages) {
+    const fp = messageFingerprint(msg);
+    const objectId = externalizedMessages.get(fp);
+    if (!objectId) continue;
+
+    const entry = store.getIndexEntry(objectId);
+    if (!entry) continue;
+
+    replaceContentWithStub(msg, {
+      id: entry.id,
+      type: entry.type,
+      tokenEstimate: entry.tokenEstimate,
+      description: entry.description,
+    });
+  }
+}
+
+// ============================================================================
+// Externalization Algorithms
+// ============================================================================
+
+/**
+ * Normal externalization pass (§5.2.1).
+ */
+export function externalize(
+  messages: AgentMessage[],
+  state: ExternalizerState,
+  threshold: number,
+  pi?: any,
+): { objectIds: string[]; tokensSaved: number } {
+  const start = Date.now();
+  const groups = buildAtomicGroups(messages);
+
+  const lastUserIndex = findLastIndex(messages, (m) => m.role === "user");
+  const lastAssistantIndex = findLastIndex(messages, (m) => m.role === "assistant");
+  const lastUser = lastUserIndex >= 0 ? messages[lastUserIndex] : undefined;
+  const lastAssistant =
+    lastAssistantIndex >= 0 ? messages[lastAssistantIndex] : undefined;
+
+  const candidates: Array<{ group: AtomicGroup; hasToolResult: boolean }> = [];
+
+  for (const group of groups) {
+    if (lastUser && group.messages.includes(lastUser)) continue;
+    if (lastAssistant && group.messages.includes(lastAssistant)) continue;
+
+    const hasWarmToolResult = group.messages.some(
+      (m) =>
+        m.role === "toolResult" &&
+        typeof m.toolCallId === "string" &&
+        state.warmTracker.isToolCallWarm(m.toolCallId),
+    );
+    if (hasWarmToolResult) continue;
+
+    const hasWarmSourceObject = group.fingerprints.some((fp) => {
+      const objectId = externalizedMessages.get(fp);
+      return objectId ? state.warmTracker.isWarm(objectId) : false;
+    });
+    if (hasWarmSourceObject) continue;
+
+    if (group.messages.some((m) => isStubContent(m))) continue;
+
+    candidates.push({
+      group,
+      hasToolResult: group.messages.some((m) => m.role === "toolResult"),
+    });
+  }
+
+  // Prioritize tool outputs first, then largest groups.
+  candidates.sort((a, b) => {
+    if (a.hasToolResult !== b.hasToolResult) {
+      return a.hasToolResult ? -1 : 1;
+    }
+    return b.group.estimatedTokens - a.group.estimatedTokens;
+  });
+
+  const objectIds: string[] = [];
+  let tokensSaved = 0;
+
+  for (const candidate of candidates) {
+    if (countMessageTokens(messages) <= threshold) break;
+
+    for (let i = 0; i < candidate.group.messages.length; i++) {
+      const message = candidate.group.messages[i];
+      const fingerprint = candidate.group.fingerprints[i];
+
+      if (externalizedMessages.has(fingerprint)) continue;
+      if (isStubContent(message)) continue;
+
+      const content = extractContent(message);
+      if (!content) continue;
+
+      const tokenEstimate = Math.ceil(content.length / 4);
+      const obj = state.store.add({
+        type: inferContentType(message),
+        description: generateDescription(message),
+        tokenEstimate,
+        content,
+        source: { kind: "externalized", fingerprint },
+      });
+
+      externalizedMessages.set(fingerprint, obj.id);
+      replaceContentWithStub(message, obj);
+
+      objectIds.push(obj.id);
+      tokensSaved += tokenEstimate;
+    }
+  }
+
+  if (objectIds.length > 0) {
+    emitEvent(pi, "rlm:externalize", {
+      objectIds,
+      count: objectIds.length,
+      tokensSaved,
+    });
+
+    state.trajectory?.append({
+      kind: "operation",
+      operation: "externalize",
+      objectIds,
+      details: { threshold, tokensSaved },
+      wallClockMs: Date.now() - start,
+      timestamp: Date.now(),
+    });
+  }
+
+  return { objectIds, tokensSaved };
+}
+
+/**
+ * Safety-valve externalization pass (§5.3).
+ */
+export function forceExternalize(
+  messages: AgentMessage[],
+  state: ExternalizerState,
+  pi?: any,
+): { objectIds: string[]; tokensSaved: number } {
+  const start = Date.now();
+  const groups = buildAtomicGroups(messages);
+
+  const lastUserIndex = findLastIndex(messages, (m) => m.role === "user");
+  const lastAssistantIndex = findLastIndex(messages, (m) => m.role === "assistant");
+  const lastUser = lastUserIndex >= 0 ? messages[lastUserIndex] : undefined;
+  const lastAssistant =
+    lastAssistantIndex >= 0 ? messages[lastAssistantIndex] : undefined;
+
+  const objectIds: string[] = [];
+  let tokensSaved = 0;
+
+  for (const group of groups) {
+    if (lastUser && group.messages.includes(lastUser)) continue;
+    if (lastAssistant && group.messages.includes(lastAssistant)) continue;
+    if (group.messages.some((m) => m.role === "system")) continue;
+
+    for (let i = 0; i < group.messages.length; i++) {
+      const message = group.messages[i];
+      const fingerprint = group.fingerprints[i];
+
+      if (message.role === "system") continue;
+      if (externalizedMessages.has(fingerprint)) continue;
+      if (isStubContent(message)) continue;
+
+      const content = extractContent(message);
+      if (!content) continue;
+
+      const tokenEstimate = Math.ceil(content.length / 4);
+      const obj = state.store.add({
+        type: inferContentType(message),
+        description: generateDescription(message),
+        tokenEstimate,
+        content,
+        source: { kind: "externalized", fingerprint },
+      });
+
+      externalizedMessages.set(fingerprint, obj.id);
+      replaceContentWithStub(message, obj);
+
+      objectIds.push(obj.id);
+      tokensSaved += tokenEstimate;
+    }
+  }
+
+  if (objectIds.length > 0) {
+    emitEvent(pi, "rlm:externalize", {
+      objectIds,
+      count: objectIds.length,
+      tokensSaved,
+    });
+
+    state.trajectory?.append({
+      kind: "operation",
+      operation: "force_externalize",
+      objectIds,
+      details: { tokensSaved },
+      wallClockMs: Date.now() - start,
+      timestamp: Date.now(),
+    });
+  }
+
+  return { objectIds, tokensSaved };
+}
+
+function injectManifest(messages: AgentMessage[], state: ExternalizerState): void {
+  const index = state.store.getFullIndex();
+  if (index.objects.length === 0) return;
+
+  const firstUserIndex = messages.findIndex((m) => m.role === "user");
+  if (firstUserIndex < 0) return;
+
+  const manifest = state.manifest.build(state.config.manifestBudget);
+  const prefix = `${manifest}\n\n---\n\n`;
+
+  const msg = messages[firstUserIndex];
+  if (Array.isArray(msg.content)) {
+    msg.content.unshift({ type: "text", text: prefix });
+    return;
+  }
+
+  if (typeof msg.content === "string") {
+    msg.content = prefix + msg.content;
+    return;
+  }
+
+  msg.content = [{ type: "text", text: prefix }];
+}
+
+// ============================================================================
+// Event Handlers
+// ============================================================================
+
+/**
+ * context handler (§4.4).
+ */
+export async function onContext(
+  event: { messages?: AgentMessage[] },
+  ctx: ExtensionContext,
+  state: ExternalizerState,
+  pi?: any,
+): Promise<{ messages: AgentMessage[] } | undefined> {
+  if (!state.enabled) return;
+  if (!state.storeHealthy) return;
+
+  const messages = Array.isArray(event.messages) ? event.messages : [];
+
+  state.turnCount += 1;
+  state.warmTracker.tick();
+
+  // Phase 0: Always stub already-externalized messages.
+  replaceExternalizedWithStubs(messages, state.store);
+
+  const usage = ctx.getContextUsage?.();
+
+  if (usage && usage.tokens !== null) {
+    const threshold = usage.contextWindow * (state.config.tokenBudgetPercent / 100);
+    const safetyThreshold = usage.contextWindow * (state.config.safetyValvePercent / 100);
+
+    // Phase 1: Normal pass
+    const postStubTokens = countMessageTokens(messages);
+    if (state.forceExternalizeOnNextTurn || postStubTokens > threshold) {
+      state.activePhases.add("externalizing");
+      state.updateWidget?.(ctx);
+      try {
+        externalize(messages, state, threshold, pi);
+        state.forceExternalizeOnNextTurn = false;
+      } finally {
+        state.activePhases.delete("externalizing");
+        state.updateWidget?.(ctx);
+      }
+    }
+
+    // Phase 2: Manifest injection
+    injectManifest(messages, state);
+
+    // Phase 3: Safety valve
+    const postManifestTokens = countMessageTokensSafe(messages);
+    if (postManifestTokens > safetyThreshold) {
+      forceExternalize(messages, state, pi);
+
+      const finalTokens = countMessageTokensSafe(messages);
+      if (finalTokens > safetyThreshold) {
+        state.allowCompaction = true;
+      }
+    }
+  } else {
+    // tokens unknown: still inject manifest/stubs but skip new externalization
+    injectManifest(messages, state);
+  }
+
+  return { messages };
+}
+
+/**
+ * session_before_compact handler (§4.5).
+ */
+export async function onBeforeCompact(
+  _event: unknown,
+  _ctx: ExtensionContext,
+  state: Pick<ExternalizerState, "enabled" | "storeHealthy" | "allowCompaction">,
+): Promise<{ cancel: true } | undefined> {
+  if (!state.enabled) return;
+  if (!state.storeHealthy) return;
+
+  if (state.allowCompaction) {
+    state.allowCompaction = false;
+    return;
+  }
+
+  return { cancel: true };
+}
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+function findLastIndex<T>(arr: T[], pred: (item: T) => boolean): number {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (pred(arr[i])) return i;
+  }
+  return -1;
 }

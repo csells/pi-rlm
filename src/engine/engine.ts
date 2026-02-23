@@ -16,6 +16,7 @@ import {
   Model,
   RlmConfig,
 } from "../types.js";
+import { buildChildSystemPrompt } from "../system-prompt.js";
 
 // ============================================================================
 // Helper Types
@@ -106,36 +107,6 @@ function parseChildResult(raw: string): ChildCallResult {
   }
   // Fallback: wrap raw text
   return { answer: raw, confidence: "low", evidence: [] };
-}
-
-/**
- * Build child system prompt.
- * Per §9.2 of the design spec.
- */
-function buildChildSystemPrompt(instructions: string, depth: number, config: RlmConfig): string {
-  const canRecurse = depth < config.maxDepth;
-  const toolNote = canRecurse
-    ? "You have access to rlm_peek, rlm_search, and rlm_query for further exploration."
-    : "You have access to rlm_peek and rlm_search. You cannot spawn further child calls.";
-
-  return `
-You are an RLM child analyzer at depth ${depth + 1}/${config.maxDepth}.
-Your task: ${instructions}
-
-The content to analyze is provided in the user message below.
-
-${toolNote}
-
-Respond with a JSON object:
-{
-  "answer": "Your analysis/answer as a string",
-  "confidence": "high" | "medium" | "low",
-  "evidence": ["relevant quote 1", "relevant quote 2"]
-}
-
-Be concise. Focus on answering the specific question. Do not explain your
-reasoning process — just provide the answer with supporting evidence.
-`.trim();
 }
 
 /**

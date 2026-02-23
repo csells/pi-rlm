@@ -1,106 +1,333 @@
 /**
- * Pi-RLM Extension Entry Point
- * Initializes the extension, wires up components, and registers tools/commands.
+ * Pi-RLM extension entry point.
+ * Wires lifecycle handlers, context externalization, and tool/command registration.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+import { homedir } from "node:os";
+import { DEFAULT_CONFIG } from "./config.js";
+import {
+  ExternalizerState,
+  onBeforeCompact,
+  onContext,
+  rebuildExternalizedMessagesFromStore,
+} from "./context/externalizer.js";
+import { ManifestBuilder } from "./context/manifest.js";
+import { WarmTracker } from "./context/warm-tracker.js";
 import { CallTree } from "./engine/call-tree.js";
 import { CostEstimator } from "./engine/cost.js";
 import { RecursiveEngine } from "./engine/engine.js";
-import { buildRlmQueryTool } from "./tools/query.js";
+import { emitEvent, safeHandler } from "./events.js";
+import { ExternalStore, getRlmStoreDir } from "./store/store.js";
+import { buildSystemPrompt } from "./system-prompt.js";
 import { buildRlmBatchTool } from "./tools/batch.js";
-import { DEFAULT_CONFIG } from "./config.js";
-import { RlmConfig, ExtensionContext, IExternalStore, ITrajectoryLogger, IWarmTracker } from "./types.js";
+import { buildRlmQueryTool } from "./tools/query.js";
+import { TrajectoryLogger } from "./trajectory.js";
+import {
+  ExtensionContext,
+  IExternalStore,
+  ITrajectoryLogger,
+  IWarmTracker,
+  RlmConfig,
+} from "./types.js";
 
 /**
- * Shared state object — created in activate() and shared across all components via closure.
+ * Shared extension state.
  */
-interface RlmState {
-  enabled: boolean;
+export interface RlmState extends ExternalizerState {
   config: RlmConfig;
   store: IExternalStore;
+  manifest: ManifestBuilder;
   engine: RecursiveEngine;
   callTree: CallTree;
   costEstimator: CostEstimator;
   trajectory: ITrajectoryLogger;
   warmTracker: IWarmTracker;
   activePhases: Set<string>;
+  sessionId: string;
+  turnCount: number;
+  storeHealthy: boolean;
+  allowCompaction: boolean;
+  forceExternalizeOnNextTurn: boolean;
+  updateWidget: (ctx: ExtensionContext) => void;
 }
 
-// ============================================================================
-// Extension Entry Point
-// ============================================================================
+function createBootstrapState(): RlmState {
+  const sessionId = "bootstrap";
+  const storeDir = getRlmStoreDir(process.cwd(), sessionId);
+  const store = new ExternalStore(storeDir, sessionId);
+  const warmTracker = new WarmTracker(DEFAULT_CONFIG.warmTurns);
+  const trajectory = new TrajectoryLogger(storeDir);
+  const callTree = new CallTree(DEFAULT_CONFIG.maxChildCalls);
+  const costEstimator = new CostEstimator(store);
+  const engine = new RecursiveEngine(
+    DEFAULT_CONFIG,
+    store,
+    trajectory,
+    callTree,
+    costEstimator,
+    warmTracker,
+  );
 
-/**
- * Activate the Pi-RLM extension.
- * Called by Pi when the extension is loaded.
- */
-export default function activate(pi: any): void {
-  console.log("[pi-rlm] Extension activated");
-
-  // Create shared state (will be populated by dependent components)
-  const state: Partial<RlmState> = {
+  return {
     enabled: true,
     config: DEFAULT_CONFIG,
-    activePhases: new Set(),
+    store,
+    manifest: new ManifestBuilder(store),
+    engine,
+    callTree,
+    costEstimator,
+    trajectory,
+    warmTracker,
+    activePhases: new Set<string>(),
+    sessionId,
+    turnCount: 0,
+    storeHealthy: true,
+    allowCompaction: false,
+    forceExternalizeOnNextTurn: false,
+    updateWidget: (_ctx) => {
+      // Widget wiring is added by task-12.
+    },
   };
+}
 
-  // Note: Full initialization requires:
-  // 1. task-1 to provide extension hooks and types
-  // 2. task-2 to provide ExternalStore, TrajectoryLogger, WarmTracker
-  //
-  // This is a placeholder showing the structure. When task-1 and task-2
-  // are available, uncomment the code below and wire it all together.
+/**
+ * Activate extension.
+ */
+export default function activate(pi: any): void {
+  const state = createBootstrapState();
 
-  // ========================================================================
-  // TODO: Wire up components when task-1 and task-2 are complete
-  // ========================================================================
+  pi.on(
+    "session_start",
+    safeHandler("session_start", async (event: any, ctx: ExtensionContext) => {
+      await onSessionStart(event, ctx, pi, state);
+    }),
+  );
 
-  // Example (to be implemented):
-  /*
-  const storeDir = path.join(ctx.cwd, ".pi", "rlm", sessionId);
-  state.store = new ExternalStore(storeDir);
+  pi.on(
+    "before_agent_start",
+    safeHandler(
+      "before_agent_start",
+      async (event: any, ctx: ExtensionContext) => onBeforeAgentStart(event, ctx, state),
+    ),
+  );
+
+  pi.on(
+    "context",
+    safeHandler("context", async (event: any, ctx: ExtensionContext) => onContext(event, ctx, state, pi)),
+  );
+
+  pi.on(
+    "session_before_compact",
+    safeHandler(
+      "compact",
+      async (event: any, ctx: ExtensionContext) => onBeforeCompact(event, ctx, state),
+    ),
+  );
+
+  pi.on(
+    "session_before_switch",
+    safeHandler(
+      "switch",
+      async (event: any, ctx: ExtensionContext) => onBeforeSwitch(event, ctx, pi, state),
+    ),
+  );
+
+  pi.on(
+    "session_shutdown",
+    safeHandler(
+      "shutdown",
+      async (event: any, ctx: ExtensionContext) => onShutdown(event, ctx, state),
+    ),
+  );
+
+  registerTools(pi, state);
+}
+
+/**
+ * session_start handler (§4.2).
+ */
+export async function onSessionStart(
+  _event: any,
+  ctx: ExtensionContext,
+  pi: any,
+  state: RlmState,
+): Promise<void> {
+  state.sessionId = (ctx as any).sessionManager?.getSessionFile?.() ?? "ephemeral";
+
+  // Reconstruct config from session entries
+  state.config = { ...DEFAULT_CONFIG };
+  const entries = (ctx as any).sessionManager?.getEntries?.() ?? [];
+  for (const entry of entries) {
+    if (entry?.type === "custom" && entry?.customType === "rlm-config") {
+      state.config = { ...DEFAULT_CONFIG, ...(entry.data ?? {}) };
+    }
+  }
+
+  state.enabled = state.config.enabled;
+  state.turnCount = 0;
+  state.allowCompaction = false;
+  state.forceExternalizeOnNextTurn = false;
+  state.activePhases.clear();
+
+  const storeDir = getRlmStoreDir(ctx.cwd, state.sessionId);
+  const store = new ExternalStore(storeDir, state.sessionId);
+
+  try {
+    await store.initialize();
+    state.storeHealthy = true;
+  } catch (err) {
+    state.storeHealthy = false;
+    console.error("[pi-rlm] Store initialization failed, falling back to vanilla behavior:", err);
+    if (ctx.hasUI) {
+      (ctx as any).ui?.notify?.(
+        "RLM store failed to initialize; falling back to standard Pi behavior.",
+        "warning",
+      );
+    }
+    return;
+  }
+
+  // Rebind session-scoped components
+  state.store = store;
+  state.manifest = new ManifestBuilder(store);
+  state.warmTracker = new WarmTracker(state.config.warmTurns);
   state.trajectory = new TrajectoryLogger(storeDir);
-  state.warmTracker = new WarmTracker(config.warmTurns);
-
-  state.callTree = new CallTree(config.maxChildCalls);
-  state.costEstimator = new CostEstimator(state.store);
+  state.callTree = new CallTree(state.config.maxChildCalls);
+  state.costEstimator = new CostEstimator(store);
   state.engine = new RecursiveEngine(
     state.config,
     state.store,
     state.trajectory,
     state.callTree,
     state.costEstimator,
-    state.warmTracker
+    state.warmTracker,
   );
 
-  // Register event handlers
-  pi.on("context", safeHandler("context", onContext));
-  pi.on("session_before_compact", safeHandler("compact", onBeforeCompact));
+  // Rebuild in-memory fingerprint -> object map for stub replacement
+  state.store.rebuildExternalizedMap();
+  rebuildExternalizedMessagesFromStore(state.store);
 
-  // Register tools
-  registerTools(pi, state as RlmState);
+  await maybeShowFirstRunNotification(ctx);
 
-  // Register commands
-  registerCommands(pi, state as RlmState);
+  const rlmDir = path.join(ctx.cwd, ".pi", "rlm");
+  cleanupOldSessions(rlmDir, state.config.retentionDays).catch((err) => {
+    console.warn("[pi-rlm] Session cleanup error:", err);
+  });
 
-  // Set up widget
-  setupWidget(pi, state as RlmState);
-  */
+  emitEvent(pi, "rlm:toggle", { enabled: state.enabled });
 
-  console.log("[pi-rlm] Initialization placeholder — awaiting task-1 and task-2 to complete");
+  if (pi?.events?.emit) {
+    pi.events.emit("rlm:initialized", {
+      sessionId: state.sessionId,
+      enabled: state.enabled,
+      timestamp: Date.now(),
+    });
+  }
+
+  state.updateWidget(ctx);
 }
 
-// ============================================================================
-// Tool Registration
-// ============================================================================
+/**
+ * before_agent_start handler (§4.3).
+ */
+export async function onBeforeAgentStart(
+  event: any,
+  _ctx: ExtensionContext,
+  state: Pick<RlmState, "enabled" | "config">,
+): Promise<{ systemPrompt: string } | undefined> {
+  if (!state.enabled) return;
+
+  const rlmPrompt = buildSystemPrompt(state.config);
+  const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
+
+  return {
+    systemPrompt: basePrompt ? `${basePrompt}\n\n${rlmPrompt}` : rlmPrompt,
+  };
+}
 
 /**
- * Register all RLM tools with the Pi extension.
+ * session_before_switch handler (§4.6).
  */
-function registerTools(pi: any, state: RlmState): void {
-  console.log("[pi-rlm] Registering tools...");
+export async function onBeforeSwitch(
+  _event: any,
+  _ctx: ExtensionContext,
+  pi: any,
+  state: Pick<RlmState, "store" | "trajectory" | "config">,
+): Promise<void> {
+  await state.store.flush();
+  await state.trajectory.flush();
 
-  // Register rlm_query
+  if (typeof pi?.appendEntry === "function") {
+    try {
+      pi.appendEntry("rlm-config", state.config);
+      pi.appendEntry("rlm-index", state.store.getFullIndex());
+    } catch (err) {
+      console.warn("[pi-rlm] Failed to append switch metadata:", err);
+    }
+  }
+}
+
+/**
+ * session_shutdown handler (§4.7).
+ */
+export async function onShutdown(
+  _event: any,
+  _ctx: ExtensionContext,
+  state: Pick<RlmState, "store" | "trajectory">,
+): Promise<void> {
+  await state.store.flush();
+  await state.trajectory.flush();
+}
+
+async function maybeShowFirstRunNotification(ctx: ExtensionContext): Promise<void> {
+  const installedFlag = path.join(homedir(), ".pi", "rlm", ".installed");
+
+  try {
+    if (fs.existsSync(installedFlag)) return;
+
+    if (ctx.hasUI) {
+      (ctx as any).ui?.notify?.(
+        "Pi-RLM is active. Use /rlm off to disable. Use /rlm for status.",
+        "info",
+      );
+    }
+
+    await fs.promises.mkdir(path.dirname(installedFlag), { recursive: true });
+    await fs.promises.writeFile(installedFlag, new Date().toISOString());
+  } catch (err) {
+    console.warn("[pi-rlm] Failed first-run notification setup:", err);
+  }
+}
+
+/**
+ * Best-effort cleanup for stale session directories (§11.4).
+ */
+async function cleanupOldSessions(rlmDir: string, retentionDays: number): Promise<void> {
+  await fs.promises.mkdir(rlmDir, { recursive: true });
+
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  const entries = await fs.promises.readdir(rlmDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+
+    const sessionDir = path.join(rlmDir, entry.name);
+    const indexPath = path.join(sessionDir, "index.json");
+
+    try {
+      const stat = await fs.promises.stat(indexPath);
+      if (stat.mtimeMs < cutoff) {
+        await fs.promises.rm(sessionDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Ignore unreadable/malformed session folders.
+    }
+  }
+}
+
+function registerTools(pi: any, state: RlmState): void {
   const queryTool = buildRlmQueryTool(
     state.config,
     state.engine,
@@ -120,7 +347,6 @@ function registerTools(pi: any, state: RlmState): void {
     execute: queryTool.execute,
   });
 
-  // Register rlm_batch
   const batchTool = buildRlmBatchTool(
     state.config,
     state.engine,
@@ -139,109 +365,11 @@ function registerTools(pi: any, state: RlmState): void {
     parameters: batchTool.parameters,
     execute: batchTool.execute,
   });
-
-  console.log("[pi-rlm] Tools registered: rlm_query, rlm_batch");
 }
 
-// ============================================================================
-// Command Registration
-// ============================================================================
-
-/**
- * Register RLM commands with the Pi extension.
- */
-function registerCommands(pi: any, state: RlmState): void {
-  console.log("[pi-rlm] Registering commands...");
-
-  pi.registerCommand("rlm", {
-    description: "RLM status and control. Usage: /rlm [on|off|cancel]",
-    handler: async (args: string | undefined, ctx: ExtensionContext) => {
-      const subcommand = args?.trim().toLowerCase();
-
-      if (subcommand === "on") {
-        state.enabled = true;
-        state.config.enabled = true;
-        if (ctx.hasUI && (ctx as any).ui?.notify) {
-          (ctx as any).ui.notify("RLM enabled. Context externalization is active.", "success");
-        }
-        return;
-      }
-
-      if (subcommand === "off") {
-        state.callTree.abortAll();
-        state.enabled = false;
-        state.config.enabled = false;
-        if (ctx.hasUI && (ctx as any).ui?.notify) {
-          (ctx as any).ui.notify("RLM disabled. Pi will use standard compaction. External store preserved on disk.", "info");
-        }
-        return;
-      }
-
-      if (subcommand === "cancel") {
-        const active = state.callTree.getActive();
-        if (active.length === 0) {
-          if (ctx.hasUI && (ctx as any).ui?.notify) {
-            (ctx as any).ui.notify("No active RLM operations.", "info");
-          }
-          return;
-        }
-        state.callTree.abortAll();
-        if (ctx.hasUI && (ctx as any).ui?.notify) {
-          (ctx as any).ui.notify(`Cancelled ${active.length} active operation(s). Partial results preserved.`, "warning");
-        }
-        return;
-      }
-
-      // Default: show status
-      if (ctx.hasUI && (ctx as any).ui?.notify) {
-        (ctx as any).ui.notify(`RLM: ${state.enabled ? "ON" : "OFF"}`, "info");
-      } else {
-        console.log(`[pi-rlm] RLM: ${state.enabled ? "ON" : "OFF"}`);
-      }
-    },
-  });
-
-  console.log("[pi-rlm] Commands registered: /rlm");
-}
-
-// ============================================================================
-// Event Handlers
-// ============================================================================
-
-/**
- * Wrap an event handler with error handling.
- */
-function safeHandler<T>(name: string, fn: (...args: any[]) => Promise<T>) {
-  return async (...args: any[]) => {
-    try {
-      return await fn(...args);
-    } catch (err) {
-      console.error(`[pi-rlm] ${name} error:`, err);
-      return undefined;
-    }
-  };
-}
-
-// ============================================================================
-// Widget Setup
-// ============================================================================
-
-/**
- * Set up the RLM status widget.
- */
-function setupWidget(pi: any, state: RlmState): void {
-  // Widget will be set up by the UI layer in a later phase
-  console.log("[pi-rlm] Widget setup placeholder");
-}
-
-// ============================================================================
-// Exports
-// ============================================================================
-
+// Public exports
 export {
   CallTree,
-  CallNode,
-  OperationEntry,
   ConcurrencyLimiter,
   CostEstimator,
   RecursiveEngine,
@@ -252,3 +380,5 @@ export * from "./types.js";
 export { DEFAULT_CONFIG, mergeConfig } from "./config.js";
 export { buildRlmQueryTool } from "./tools/query.js";
 export { buildRlmBatchTool } from "./tools/batch.js";
+export { safeToolExecute, safeHandler } from "./events.js";
+export { ExternalStore, getRlmStoreDir } from "./store/store.js";
