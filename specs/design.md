@@ -25,6 +25,7 @@ TypeScript.
 11. [Configuration and Persistence](#11-configuration-and-persistence) — incl. §11.3 Large Store Performance
 12. [Error Handling Strategy](#12-error-handling-strategy)
 13. [Implementation Phases](#13-implementation-phases) — with phase sequencing rationale
+14. [Testing Strategy](#14-testing-strategy) — unit, component, integration, LLM behavior tests
 
 ---
 
@@ -2297,6 +2298,1259 @@ for general use.
 8. Model routing configuration (FR-5.7, FR-9.4)
 9. Non-interactive mode support — check `ctx.hasUI` (NFR-1.5)
 10. `pi.events` emission for inter-extension communication (NFR-4.3)
+
+---
+
+## 14. Testing Strategy
+
+### 14.1 Test Levels
+
+The testing strategy has three levels. **All three run on every push** — there
+is no "optional" tier. If the model can't use the tools correctly with a real
+LLM, the extension is broken and we need to know immediately, not after a user
+reports it.
+
+| Level | What it catches | Runs against | Speed |
+|-------|----------------|-------------|-------|
+| **Unit** | Logic bugs in isolated components | Mock objects, no Pi | <1s per test |
+| **Component** | Wiring bugs between extension modules | Mock Pi API surface | <2s per test |
+| **E2E** | Everything else: real Pi, real model, real externalization, real retrieval | Pi RPC mode + live LLM | 30–120s per test |
+
+The E2E tests are the most important tier. Unit and component tests catch
+regressions fast, but only E2E tests answer the question: "Does the model
+actually use RLM correctly to maintain infinite context?" Pi's agent is
+already configured with model providers — no separate API key setup is needed.
+
+### 14.2 Test Infrastructure
+
+**Framework:** Vitest (already a Pi ecosystem standard, zero config with
+TypeScript, built-in mocking, watch mode).
+
+**Project structure:**
+
+```
+pi-rlm/
+├── vitest.config.ts
+├── tests/
+│   ├── helpers/
+│   │   ├── mock-pi.ts           # Mock ExtensionAPI, ExtensionContext factories
+│   │   ├── mock-store.ts        # Pre-populated ExternalStore for testing
+│   │   ├── mock-messages.ts     # AgentMessage factories (user, assistant, toolResult)
+│   │   ├── pi-harness.ts        # RPC-mode test harness for e2e tests
+│   │   └── assertions.ts        # Custom matchers (toBeExternalized, toHaveStub, etc.)
+│   ├── unit/
+│   │   ├── store.test.ts
+│   │   ├── manifest.test.ts
+│   │   ├── fingerprint.test.ts
+│   │   ├── warm-tracker.test.ts
+│   │   ├── call-tree.test.ts
+│   │   ├── concurrency.test.ts
+│   │   ├── cost-estimator.test.ts
+│   │   ├── write-queue.test.ts
+│   │   └── tokens.test.ts
+│   ├── component/
+│   │   ├── externalizer.test.ts
+│   │   ├── context-handler.test.ts
+│   │   ├── compaction-intercept.test.ts
+│   │   ├── tools-peek.test.ts
+│   │   ├── tools-search.test.ts
+│   │   ├── tools-query.test.ts
+│   │   ├── tools-batch.test.ts
+│   │   ├── tools-ingest.test.ts
+│   │   ├── commands.test.ts
+│   │   └── widget.test.ts
+│   └── e2e/
+│       ├── scenario-long-session.test.ts
+│       ├── scenario-ingest-and-analyze.test.ts
+│       ├── scenario-cross-turn-retrieval.test.ts
+│       ├── scenario-session-resume.test.ts
+│       ├── scenario-cancel-mid-operation.test.ts
+│       ├── scenario-disable-enable.test.ts
+│       └── scenario-no-confabulation.test.ts
+```
+
+**Vitest config:**
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    include: ["tests/**/*.test.ts"],
+    globals: true,
+    testTimeout: 10_000,           // Unit/component: 10s
+    hookTimeout: 30_000,
+    // Separate integration/LLM tests by tag
+    typecheck: { enabled: true },
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.ts"],
+      exclude: ["src/**/*.test.ts", "src/ui/**"],  // UI tests are manual
+      thresholds: {
+        lines: 80,
+        branches: 75,
+        functions: 80,
+      },
+    },
+  },
+});
+```
+
+### 14.3 Mock Factories
+
+These factories create typed mocks of Pi's API surface, enabling component
+tests without a running Pi instance.
+
+```typescript
+// tests/helpers/mock-messages.ts
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+
+let msgCounter = 0;
+
+/** Create a user message with a unique timestamp. */
+export function userMsg(text: string, timestamp?: number): AgentMessage {
+  return {
+    role: "user" as const,
+    content: [{ type: "text" as const, text }],
+    timestamp: timestamp ?? Date.now() + (msgCounter++),
+  };
+}
+
+/** Create an assistant message with a unique timestamp. */
+export function assistantMsg(text: string, timestamp?: number): AgentMessage {
+  return {
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text }],
+    api: "anthropic-messages" as any,
+    provider: "anthropic",
+    model: "test-model",
+    usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0,
+             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop" as const,
+    timestamp: timestamp ?? Date.now() + (msgCounter++),
+  };
+}
+
+/** Create a tool result message with a unique toolCallId. */
+export function toolResultMsg(
+  toolName: string,
+  text: string,
+  toolCallId?: string,
+): AgentMessage {
+  return {
+    role: "toolResult" as const,
+    toolCallId: toolCallId ?? `call_${msgCounter++}`,
+    toolName,
+    content: [{ type: "text" as const, text }],
+    isError: false,
+    timestamp: Date.now() + (msgCounter++),
+  };
+}
+
+/** Create a large tool output (for externalization tests). */
+export function largeToolResult(sizeChars: number): AgentMessage {
+  return toolResultMsg("bash", "x".repeat(sizeChars));
+}
+```
+
+```typescript
+// tests/helpers/mock-pi.ts
+import type {
+  ExtensionAPI, ExtensionContext, ExtensionUIContext, ContextUsage,
+} from "@mariozechner/pi-coding-agent";
+
+/** Create a mock ExtensionContext with configurable overrides. */
+export function mockCtx(overrides?: {
+  tokens?: number | null;
+  contextWindow?: number;
+  hasUI?: boolean;
+  cwd?: string;
+}): ExtensionContext {
+  const tokens = overrides?.tokens ?? 50_000;
+  const contextWindow = overrides?.contextWindow ?? 200_000;
+
+  return {
+    hasUI: overrides?.hasUI ?? false,
+    cwd: overrides?.cwd ?? "/tmp/test",
+    model: {
+      id: "test-model", name: "Test", api: "anthropic-messages" as any,
+      provider: "test", baseUrl: "", reasoning: false, input: ["text"],
+      cost: { input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite: 3.75 },
+      contextWindow, maxTokens: 8192,
+    } as any,
+    modelRegistry: { find: () => null } as any,
+    sessionManager: {
+      getSessionFile: () => "test-session",
+      getEntries: () => [],
+      getBranch: () => [],
+    } as any,
+    ui: mockUI(),
+    isIdle: () => true,
+    abort: () => {},
+    hasPendingMessages: () => false,
+    shutdown: () => {},
+    getContextUsage: (): ContextUsage | undefined =>
+      tokens === null ? { tokens: null, contextWindow, percent: null }
+        : { tokens, contextWindow, percent: (tokens / contextWindow) * 100 },
+    compact: () => {},
+    getSystemPrompt: () => "",
+  };
+}
+
+function mockUI(): ExtensionUIContext {
+  return {
+    select: async () => undefined,
+    confirm: async () => true,
+    input: async () => undefined,
+    notify: () => {},
+    onTerminalInput: () => () => {},
+    setStatus: () => {},
+    setWorkingMessage: () => {},
+    setWidget: () => {},
+    setFooter: () => {},
+    setHeader: () => {},
+    setTitle: () => {},
+    custom: async () => undefined as any,
+    pasteToEditor: () => {},
+    setEditorText: () => {},
+    getEditorText: () => "",
+    editor: async () => undefined,
+    setEditorComponent: () => {},
+    theme: {} as any,
+    getAllThemes: () => [],
+    getTheme: () => undefined,
+    setTheme: () => ({ success: false }),
+    getToolsExpanded: () => false,
+    setToolsExpanded: () => {},
+  };
+}
+
+/** Create a mock ExtensionAPI that records registrations. */
+export function mockPi(): ExtensionAPI & {
+  _handlers: Map<string, Function[]>;
+  _tools: Map<string, any>;
+  _commands: Map<string, any>;
+  _entries: Array<{ type: string; data: any }>;
+} {
+  const handlers = new Map<string, Function[]>();
+  const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const entries: Array<{ type: string; data: any }> = [];
+
+  return {
+    _handlers: handlers,
+    _tools: tools,
+    _commands: commands,
+    _entries: entries,
+    on: (event: string, handler: Function) => {
+      if (!handlers.has(event)) handlers.set(event, []);
+      handlers.get(event)!.push(handler);
+    },
+    registerTool: (def: any) => { tools.set(def.name, def); },
+    registerCommand: (name: string, opts: any) => { commands.set(name, opts); },
+    appendEntry: (type: string, data: any) => { entries.push({ type, data }); },
+    events: { on: () => {}, emit: () => {} } as any,
+    // Stubs for other methods:
+    registerShortcut: () => {},
+    registerFlag: () => {},
+    getFlag: () => undefined,
+    registerMessageRenderer: () => {},
+    sendMessage: () => {},
+    sendUserMessage: () => {},
+    setSessionName: () => {},
+    getSessionName: () => undefined,
+    setLabel: () => {},
+    exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    setActiveTools: () => {},
+    getCommands: () => [],
+    setModel: async () => true,
+    getThinkingLevel: () => "off" as any,
+    setThinkingLevel: () => {},
+    registerProvider: () => {},
+  } as any;
+}
+```
+
+### 14.4 Unit Test Specifications
+
+Each unit test file covers one module in isolation:
+
+**`tests/unit/store.test.ts`** — Phase 1
+
+```typescript
+describe("ExternalStore", () => {
+  let store: ExternalStore;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rlm-test-"));
+    store = new ExternalStore(tmpDir);
+    await store.initialize();
+  });
+
+  afterEach(() => fs.promises.rm(tmpDir, { recursive: true }));
+
+  it("add() returns a StoreRecord with unique ID", () => {
+    const obj = store.add({
+      type: "file", description: "test.ts", content: "const x = 1;",
+      source: { kind: "ingested", path: "/tmp/test.ts" },
+    });
+    expect(obj.id).toMatch(/^rlm-obj-/);
+    expect(obj.tokenEstimate).toBe(Math.ceil(12 / 4)); // "const x = 1;" = 12 chars
+  });
+
+  it("get() retrieves content by ID", () => {
+    const obj = store.add({ type: "file", description: "test", content: "hello",
+      source: { kind: "ingested", path: "/tmp/test" } });
+    expect(store.get(obj.id)?.content).toBe("hello");
+  });
+
+  it("get() returns null for unknown ID", () => {
+    expect(store.get("rlm-obj-nonexistent")).toBeNull();
+  });
+
+  it("getFullIndex() reflects all added objects", () => {
+    store.add({ type: "file", description: "a", content: "aaa",
+      source: { kind: "ingested", path: "/a" } });
+    store.add({ type: "file", description: "b", content: "bbb",
+      source: { kind: "ingested", path: "/b" } });
+    const index = store.getFullIndex();
+    expect(index.objects).toHaveLength(2);
+    expect(index.totalTokens).toBe(2); // ceil(3/4) + ceil(3/4) = 1 + 1
+  });
+
+  it("persists to disk and survives re-initialization", async () => {
+    store.add({ type: "file", description: "persist", content: "data",
+      source: { kind: "ingested", path: "/persist" } });
+    await store.flush();
+
+    const store2 = new ExternalStore(tmpDir);
+    await store2.initialize();
+    expect(store2.getFullIndex().objects).toHaveLength(1);
+    expect(store2.get(store2.getFullIndex().objects[0].id)?.content).toBe("data");
+  });
+
+  it("rebuildExternalizedMap() populates fingerprint→objectId mapping", () => {
+    store.add({ type: "conversation", description: "msg", content: "hello",
+      source: { kind: "externalized", fingerprint: "user:1234567890" } });
+    store.rebuildExternalizedMap();
+    // Verify via the store's internal map (exposed for testing)
+    expect(store.getExternalizedObjectId("user:1234567890")).toBeDefined();
+  });
+
+  it("survives corrupt JSONL lines on rebuild", async () => {
+    store.add({ type: "file", description: "good", content: "ok",
+      source: { kind: "ingested", path: "/good" } });
+    await store.flush();
+    // Append a corrupt line
+    await fs.promises.appendFile(
+      path.join(tmpDir, "store.jsonl"), "\n{broken json\n"
+    );
+    // Delete index to force rebuild from JSONL
+    await fs.promises.unlink(path.join(tmpDir, "index.json"));
+
+    const store2 = new ExternalStore(tmpDir);
+    await store2.initialize();
+    expect(store2.getFullIndex().objects).toHaveLength(1); // Good line survives
+  });
+});
+```
+
+**`tests/unit/fingerprint.test.ts`** — Phase 1
+
+```typescript
+describe("messageFingerprint", () => {
+  it("uses role:timestamp for UserMessage", () => {
+    const msg = userMsg("hello", 1700000000000);
+    expect(messageFingerprint(msg)).toBe("user:1700000000000");
+  });
+
+  it("uses role:timestamp for AssistantMessage", () => {
+    const msg = assistantMsg("world", 1700000000001);
+    expect(messageFingerprint(msg)).toBe("assistant:1700000000001");
+  });
+
+  it("uses toolResult:toolCallId for ToolResultMessage", () => {
+    const msg = toolResultMsg("bash", "output", "call_abc123");
+    expect(messageFingerprint(msg)).toBe("toolResult:call_abc123");
+  });
+
+  it("is stable across calls for the same message", () => {
+    const msg = userMsg("hello", 12345);
+    expect(messageFingerprint(msg)).toBe(messageFingerprint(msg));
+  });
+
+  it("is unique for messages with different timestamps", () => {
+    const a = userMsg("hello", 1);
+    const b = userMsg("hello", 2);
+    expect(messageFingerprint(a)).not.toBe(messageFingerprint(b));
+  });
+});
+```
+
+**`tests/unit/call-tree.test.ts`** — Phase 2
+
+```typescript
+describe("CallTree", () => {
+  it("registerOperation returns an AbortController", () => {
+    const tree = new CallTree(50);
+    const controller = tree.registerOperation("op-1", 0.01);
+    expect(controller).toBeInstanceOf(AbortController);
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  it("abortAll() aborts all registered operations", () => {
+    const tree = new CallTree(50);
+    const c1 = tree.registerOperation("op-1", 0);
+    const c2 = tree.registerOperation("op-2", 0);
+    tree.abortAll();
+    expect(c1.signal.aborted).toBe(true);
+    expect(c2.signal.aborted).toBe(true);
+  });
+
+  it("incrementChildCalls returns false when budget exceeded", () => {
+    const tree = new CallTree(3); // maxChildCalls = 3
+    tree.registerOperation("op-1", 0);
+    expect(tree.incrementChildCalls("op-1")).toBe(true);  // 1
+    expect(tree.incrementChildCalls("op-1")).toBe(true);  // 2
+    expect(tree.incrementChildCalls("op-1")).toBe(true);  // 3
+    expect(tree.incrementChildCalls("op-1")).toBe(false); // 4 > 3
+  });
+
+  it("per-operation budget is independent across operations", () => {
+    const tree = new CallTree(2);
+    tree.registerOperation("op-1", 0);
+    tree.registerOperation("op-2", 0);
+    expect(tree.incrementChildCalls("op-1")).toBe(true);
+    expect(tree.incrementChildCalls("op-1")).toBe(true);
+    expect(tree.incrementChildCalls("op-1")).toBe(false); // op-1 exhausted
+    expect(tree.incrementChildCalls("op-2")).toBe(true);  // op-2 independent
+  });
+
+  it("completeOperation removes the operation", () => {
+    const tree = new CallTree(50);
+    tree.registerOperation("op-1", 0);
+    tree.completeOperation("op-1");
+    expect(tree.incrementChildCalls("op-1")).toBe(false); // op gone
+  });
+});
+```
+
+### 14.5 Component Test Specifications
+
+Component tests wire together multiple modules with mocked Pi APIs.
+
+**`tests/component/context-handler.test.ts`** — Phase 1
+
+```typescript
+describe("context event handler", () => {
+  let state: RlmState;
+  let ctx: ExtensionContext;
+
+  beforeEach(async () => {
+    state = await createTestState(); // Initializes store, manifest, etc. in tmpDir
+    ctx = mockCtx({ tokens: 130_000, contextWindow: 200_000 }); // 65% — above 60% threshold
+  });
+
+  it("replaces already-externalized messages with stubs", async () => {
+    // Pre-externalize a message
+    const msg = userMsg("original content", 1000);
+    state.store.add({
+      type: "conversation", description: "user msg", content: "original content",
+      source: { kind: "externalized", fingerprint: messageFingerprint(msg) },
+    });
+    state.store.rebuildExternalizedMap();
+
+    const messages = [msg, userMsg("current question", 2000)];
+    const result = await onContext({ type: "context", messages }, ctx);
+
+    // First message should be stubbed
+    const firstContent = result!.messages![1].content[0].text; // [0] is manifest
+    expect(firstContent).toContain("[RLM externalized:");
+    // Second message (most recent) should NOT be stubbed
+    expect(result!.messages![2].content[0].text).toBe("current question");
+  });
+
+  it("externalizes when above tokenBudgetPercent threshold", async () => {
+    const messages = [
+      largeToolResult(100_000),    // ~25K tokens — this should get externalized
+      userMsg("keep this", 9999),
+    ];
+    const result = await onContext({ type: "context", messages }, ctx);
+
+    // Store should now have an object
+    expect(state.store.getFullIndex().objects).toHaveLength(1);
+    // The large message should be stubbed in the returned messages
+    const stubbed = result!.messages!.find(m =>
+      typeof m.content !== "string" && m.content[0]?.text?.includes("[RLM externalized:")
+    );
+    expect(stubbed).toBeDefined();
+  });
+
+  it("never externalizes the most recent user or assistant message", async () => {
+    const messages = [
+      largeToolResult(50_000),
+      assistantMsg("recent response", 8888),
+      userMsg("recent question", 9999),
+    ];
+    const result = await onContext({ type: "context", messages }, ctx);
+
+    // The assistant and user messages should survive untouched
+    const texts = result!.messages!
+      .filter(m => m.role !== "user" || !m.content[0]?.text?.includes("RLM External"))
+      .map(m => m.content[0]?.text);
+    expect(texts).toContain("recent response");
+    expect(texts).toContain("recent question");
+  });
+
+  it("injects manifest when store has objects", async () => {
+    state.store.add({ type: "file", description: "test.ts", content: "code",
+      source: { kind: "ingested", path: "/test.ts" } });
+
+    const messages = [userMsg("hello")];
+    const result = await onContext({ type: "context", messages }, ctx);
+
+    expect(result!.messages![0].role).toBe("user");
+    expect(result!.messages![0].content[0].text).toContain("RLM External Context");
+  });
+
+  it("skips externalization when tokens are null", async () => {
+    ctx = mockCtx({ tokens: null });
+    state.store.add({ type: "file", description: "existing", content: "data",
+      source: { kind: "externalized", fingerprint: "user:1000" } });
+    state.store.rebuildExternalizedMap();
+
+    const messages = [userMsg("hello", 1000), userMsg("world", 2000)];
+    const result = await onContext({ type: "context", messages }, ctx);
+
+    // Should still replace existing stubs and inject manifest
+    // but should NOT externalize new content
+    expect(state.store.getFullIndex().objects).toHaveLength(1); // No new objects
+  });
+
+  it("warm content is not re-externalized", async () => {
+    const msg = toolResultMsg("bash", "some output", "call_warm");
+    state.store.add({ type: "tool_output", description: "bash output",
+      content: "some output",
+      source: { kind: "externalized", fingerprint: messageFingerprint(msg) } });
+    state.store.rebuildExternalizedMap();
+    const objId = state.store.getExternalizedObjectId(messageFingerprint(msg))!;
+    state.warmTracker.markWarm([objId]); // Mark as warm
+
+    // The message appears in context (Pi restored it from session)
+    // but since it's warm, it should get its stub but not be re-externalized
+    // (it's already externalized — warm just prevents re-processing the same msg)
+    const messages = [msg, userMsg("question")];
+    const result = await onContext({ type: "context", messages }, ctx);
+
+    // Stub should still be applied (it's externalized)
+    const content = result!.messages![1].content[0].text;
+    expect(content).toContain("[RLM externalized:");
+  });
+});
+```
+
+**`tests/component/tools-peek.test.ts`** — Phase 1
+
+```typescript
+describe("rlm_peek tool", () => {
+  it("returns a slice of the object content", async () => {
+    const tool = state.tools.get("rlm_peek")!;
+    const obj = state.store.add({ type: "file", description: "big",
+      content: "ABCDEFGHIJ", source: { kind: "ingested", path: "/big" } });
+
+    const result = await tool.execute("tc1", { id: obj.id, offset: 2, length: 5 },
+      undefined, undefined, ctx);
+
+    expect(result.content[0].text).toBe("CDEFG");
+  });
+
+  it("indicates continuation when content remains", async () => {
+    const tool = state.tools.get("rlm_peek")!;
+    const obj = state.store.add({ type: "file", description: "big",
+      content: "A".repeat(5000), source: { kind: "ingested", path: "/big" } });
+
+    const result = await tool.execute("tc1", { id: obj.id, offset: 0, length: 100 },
+      undefined, undefined, ctx);
+
+    expect(result.content[0].text).toContain("Use offset=100 to continue");
+  });
+
+  it("returns error when RLM is disabled", async () => {
+    state.enabled = false;
+    const tool = state.tools.get("rlm_peek")!;
+    const result = await tool.execute("tc1", { id: "any", offset: 0, length: 100 },
+      undefined, undefined, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("RLM is disabled");
+  });
+
+  it("returns error for nonexistent object ID", async () => {
+    const tool = state.tools.get("rlm_peek")!;
+    const result = await tool.execute("tc1", { id: "rlm-obj-nope", offset: 0, length: 100 },
+      undefined, undefined, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not found");
+  });
+});
+```
+
+### 14.6 E2E Tests — Real Pi, Real Models, Real Scenarios
+
+E2E tests are a **development tool**. You run them locally, while you're
+building, to know whether what you just wrote actually works with a real model
+before you ever push. They are the primary quality gate — not CI, not code
+review, not manual testing. If the E2E scenarios don't pass on your machine,
+you're not done.
+
+**Test harness:** All E2E tests use Pi's **RPC mode**
+(`pi --mode rpc -e ./src/index.ts --no-session`) for programmatic control.
+The harness sends prompts via stdin JSON and reads events from stdout JSON lines.
+
+**Assertion style:** E2E tests use **behavioral assertions** — did the model
+call the right tool? did the answer contain the expected fact? did compaction
+fire? They do NOT assert exact strings (models are non-deterministic). Each
+test gets 1 automatic retry to handle model non-determinism.
+
+```typescript
+// tests/helpers/pi-harness.ts
+import { spawn, ChildProcess } from "node:child_process";
+import * as readline from "node:readline";
+
+export class PiHarness {
+  private proc: ChildProcess;
+  private rl: readline.Interface;
+  private events: any[] = [];
+  private pendingResolvers: Array<(event: any) => void> = [];
+
+  static async start(extensionPath: string, opts?: {
+    cwd?: string;
+  }): Promise<PiHarness> {
+    const harness = new PiHarness(extensionPath, opts);
+    await harness.waitForReady();
+    return harness;
+  }
+
+  private constructor(extensionPath: string, opts?: { cwd?: string }) {
+    this.proc = spawn("pi", [
+      "--mode", "rpc",
+      "-e", extensionPath,
+      "--no-session",
+    ], { cwd: opts?.cwd ?? "/tmp/pi-rlm-test" });
+
+    this.rl = readline.createInterface({ input: this.proc.stdout! });
+    this.rl.on("line", (line) => {
+      try {
+        const event = JSON.parse(line);
+        this.events.push(event);
+        for (let i = this.pendingResolvers.length - 1; i >= 0; i--) {
+          this.pendingResolvers[i](event);
+        }
+      } catch { /* ignore non-JSON lines */ }
+    });
+  }
+
+  /** Send a command to Pi via RPC. */
+  send(cmd: Record<string, any>): void {
+    this.proc.stdin!.write(JSON.stringify(cmd) + "\n");
+  }
+
+  /** Send a prompt and wait for agent_end. Returns events from this run. */
+  async prompt(text: string, timeoutMs = 120_000): Promise<any[]> {
+    const startIdx = this.events.length;
+    this.send({ type: "prompt", message: text });
+    await this.waitFor("agent_end", timeoutMs);
+    return this.events.slice(startIdx);
+  }
+
+  /** Steer (interrupt) with a new message during streaming. */
+  steer(text: string): void {
+    this.send({ type: "prompt", message: text, streamingBehavior: "steer" });
+  }
+
+  /** Wait for a specific event type. */
+  async waitFor(type: string, timeoutMs = 60_000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Timeout waiting for ${type}`)), timeoutMs
+      );
+      const check = (event: any) => {
+        if (event.type === type) {
+          clearTimeout(timer);
+          this.pendingResolvers = this.pendingResolvers.filter(r => r !== check);
+          resolve(event);
+        }
+      };
+      const existing = this.events.find(e => e.type === type);
+      if (existing) { clearTimeout(timer); resolve(existing); return; }
+      this.pendingResolvers.push(check);
+    });
+  }
+
+  /** Get all tool_execution_end events for a specific tool. */
+  toolResults(toolName: string): any[] {
+    return this.events.filter(e =>
+      e.type === "tool_execution_end" && e.toolName === toolName
+    );
+  }
+
+  /** Get all tool_execution_end events for any rlm_* tool. */
+  rlmToolResults(): any[] {
+    return this.events.filter(e =>
+      e.type === "tool_execution_end" && e.toolName?.startsWith("rlm_")
+    );
+  }
+
+  /** Count of auto_compaction_end events (should be 0 if RLM is working). */
+  compactionCount(): number {
+    return this.events.filter(e => e.type === "auto_compaction_end").length;
+  }
+
+  /** Extract text from the last assistant message in a set of events. */
+  lastAssistantText(events?: any[]): string {
+    const pool = events ?? this.events;
+    const msgs = pool
+      .filter(e => e.type === "message_end" && e.message?.role === "assistant")
+      .map(e => e.message);
+    const last = msgs.pop();
+    return last?.content
+      ?.filter((c: any) => c.type === "text")
+      ?.map((c: any) => c.text)
+      ?.join("") ?? "";
+  }
+
+  /** Reset event log (useful between scenarios in the same session). */
+  clearEvents(): void { this.events = []; }
+
+  async stop(): Promise<void> {
+    this.proc.kill("SIGTERM");
+    return new Promise(resolve => this.proc.on("exit", resolve));
+  }
+}
+```
+
+```typescript
+// tests/helpers/assertions.ts
+
+/** Assert the model called a specific tool at least once. */
+export function expectToolUsed(events: any[], toolName: string): void {
+  const calls = events.filter(e =>
+    e.type === "tool_execution_end" && e.toolName === toolName
+  );
+  expect(calls.length, `Expected model to call ${toolName}`).toBeGreaterThan(0);
+}
+
+/** Assert the model did NOT call a specific tool. */
+export function expectToolNotUsed(events: any[], toolName: string): void {
+  const calls = events.filter(e =>
+    e.type === "tool_execution_end" && e.toolName === toolName
+  );
+  expect(calls.length, `Expected model NOT to call ${toolName}`).toBe(0);
+}
+
+/** Assert the last assistant message contains a substring (case-insensitive). */
+export function expectAnswerContains(pi: PiHarness, substring: string, events?: any[]): void {
+  const text = pi.lastAssistantText(events);
+  expect(text.toLowerCase()).toContain(substring.toLowerCase());
+}
+
+/** Assert the model gave an honest "not found" response (no confabulation). */
+export function expectHonestMiss(pi: PiHarness, events?: any[]): void {
+  const text = pi.lastAssistantText(events).toLowerCase();
+  const honest =
+    text.includes("don't") || text.includes("couldn't find") ||
+    text.includes("no results") || text.includes("not found") ||
+    text.includes("didn't read") || text.includes("no matching") ||
+    text.includes("doesn't appear") || text.includes("not in");
+  expect(honest, "Model should honestly report missing content, not confabulate").toBe(true);
+}
+```
+
+Each E2E test file is a **scenario** — a coherent multi-turn story that
+exercises one core RLM capability end-to-end with a real model. Every scenario
+starts a fresh Pi session and tears it down afterward. Every scenario has
+`{ retry: 1 }` to handle model non-determinism.
+
+---
+
+**Scenario 1: Long Session — Externalization + Retrieval**
+(`tests/e2e/scenario-long-session.test.ts`)
+
+The foundational scenario. Verifies the entire externalization → stub → manifest
+→ retrieval pipeline works with a real model. This is the single most important
+test — if it fails, the extension doesn't work.
+
+```typescript
+describe("Scenario: long session with externalization and retrieval", () => {
+  let pi: PiHarness;
+
+  beforeAll(async () => {
+    pi = await PiHarness.start("./src/index.ts");
+  }, 30_000);
+
+  afterAll(() => pi.stop());
+
+  it("reads a large file, externalizes it, then retrieves facts from it", async () => {
+    // Turn 1: Read a large file — this generates a big tool output
+    await pi.prompt("Read /etc/services and tell me how many lines it has");
+
+    // Turns 2–6: Generate enough context to push past the externalization threshold
+    for (let i = 0; i < 5; i++) {
+      pi.clearEvents();
+      await pi.prompt(
+        `Read /etc/services from line ${i * 200 + 1} to ${(i + 1) * 200} and ` +
+        `list any services on port 80-100 in that range`
+      );
+    }
+
+    // Turn 7: Ask about the original content — model must retrieve from store
+    pi.clearEvents();
+    const events = await pi.prompt(
+      "What port does the 'http' service use according to /etc/services?"
+    );
+
+    // Model MUST use an RLM tool to answer (content was externalized)
+    const rlmCalls = events.filter(e =>
+      e.type === "tool_execution_end" && e.toolName?.startsWith("rlm_")
+    );
+    expect(rlmCalls.length, "Model must use RLM tools to retrieve externalized content")
+      .toBeGreaterThan(0);
+
+    // Model MUST get the right answer
+    expectAnswerContains(pi, "80", events);
+  }, 300_000);
+
+  it("never triggers auto-compaction", () => {
+    // After all those turns, compaction should NOT have fired
+    expect(pi.compactionCount()).toBe(0);
+  });
+}, { retry: 1 });
+```
+
+---
+
+**Scenario 2: Cross-Turn Retrieval**
+(`tests/e2e/scenario-cross-turn-retrieval.test.ts`)
+
+Tests that the model can recall content from much earlier in the conversation
+after it has been externalized, and that the manifest guides retrieval.
+
+```typescript
+describe("Scenario: cross-turn retrieval", () => {
+  let pi: PiHarness;
+
+  beforeAll(async () => {
+    pi = await PiHarness.start("./src/index.ts");
+  }, 30_000);
+
+  afterAll(() => pi.stop());
+
+  it("retrieves content discussed 10+ turns ago", async () => {
+    // Turn 1: Discuss a specific topic
+    await pi.prompt("Read /etc/hosts and explain every entry");
+
+    // Turns 2–10: Build up lots of unrelated context to force externalization
+    for (let i = 0; i < 9; i++) {
+      await pi.prompt(
+        `Read /etc/services from line ${i * 100 + 1} to ${(i + 1) * 100} ` +
+        `and count TCP vs UDP entries`
+      );
+    }
+
+    // Turn 11: Ask about the /etc/hosts content from turn 1
+    pi.clearEvents();
+    const events = await pi.prompt(
+      "Remember when you read /etc/hosts at the start? " +
+      "What was the IP address for localhost?"
+    );
+
+    // CRITICAL: Model must search external store — not say "I don't have it"
+    expectToolUsed(events, "rlm_search");
+    expectAnswerContains(pi, "127.0.0.1", events);
+  }, 600_000);
+
+  it("manifest lists the hosts file object", async () => {
+    pi.clearEvents();
+    const events = await pi.prompt(
+      "What objects are in your RLM external store? List them."
+    );
+
+    // Model should reference the manifest and mention the hosts file
+    const text = pi.lastAssistantText(events).toLowerCase();
+    expect(text).toContain("hosts");
+    expect(text).toContain("rlm-obj-");
+  }, 60_000);
+}, { retry: 1 });
+```
+
+---
+
+**Scenario 3: Ingest + Analyze a Codebase**
+(`tests/e2e/scenario-ingest-and-analyze.test.ts`)
+
+Tests the whole `rlm_ingest` → `rlm_query`/`rlm_batch` pipeline — the model
+ingests files, then performs analysis over externalized objects.
+
+```typescript
+describe("Scenario: ingest and analyze", () => {
+  let pi: PiHarness;
+  let testDir: string;
+
+  beforeAll(async () => {
+    // Create a small test project to ingest
+    testDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rlm-e2e-"));
+    await fs.promises.writeFile(path.join(testDir, "math.ts"),
+      `export function add(a: number, b: number): number { return a + b; }\n` +
+      `export function multiply(a: number, b: number): number { return a * b; }\n`
+    );
+    await fs.promises.writeFile(path.join(testDir, "string.ts"),
+      `export function capitalize(s: string): string { return s[0].toUpperCase() + s.slice(1); }\n` +
+      `export function reverse(s: string): string { return s.split("").reverse().join(""); }\n`
+    );
+    await fs.promises.writeFile(path.join(testDir, "index.ts"),
+      `export { add, multiply } from "./math";\n` +
+      `export { capitalize, reverse } from "./string";\n`
+    );
+
+    pi = await PiHarness.start("./src/index.ts", { cwd: testDir });
+  }, 30_000);
+
+  afterAll(async () => {
+    await pi.stop();
+    await fs.promises.rm(testDir, { recursive: true });
+  });
+
+  it("ingests files and can query across them", async () => {
+    // Step 1: Ingest the project
+    const ingestEvents = await pi.prompt(
+      `Use rlm_ingest to ingest all .ts files in ${testDir}`
+    );
+    expectToolUsed(ingestEvents, "rlm_ingest");
+
+    // Step 2: Ask an analytical question that spans files
+    pi.clearEvents();
+    const queryEvents = await pi.prompt(
+      "Using the RLM store, list all exported functions across all files " +
+      "and categorize them by their parameter types"
+    );
+
+    // Model should use rlm_query or rlm_peek + rlm_search to answer
+    const rlmCalls = queryEvents.filter(e =>
+      e.type === "tool_execution_end" && e.toolName?.startsWith("rlm_")
+    );
+    expect(rlmCalls.length).toBeGreaterThan(0);
+
+    // Answer should reference all functions
+    const text = pi.lastAssistantText(queryEvents).toLowerCase();
+    expect(text).toContain("add");
+    expect(text).toContain("multiply");
+    expect(text).toContain("capitalize");
+    expect(text).toContain("reverse");
+  }, 180_000);
+
+  it("batch analysis works over ingested objects", async () => {
+    pi.clearEvents();
+    const batchEvents = await pi.prompt(
+      "Use rlm_batch to analyze each ingested file and generate a one-line " +
+      "summary of what it exports"
+    );
+    expectToolUsed(batchEvents, "rlm_batch");
+
+    // Batch should have processed multiple objects
+    const batchResults = batchEvents.filter(e =>
+      e.type === "tool_execution_end" && e.toolName === "rlm_batch"
+    );
+    expect(batchResults.length).toBeGreaterThan(0);
+  }, 180_000);
+}, { retry: 1 });
+```
+
+---
+
+**Scenario 4: Session Resume**
+(`tests/e2e/scenario-session-resume.test.ts`)
+
+Tests that externalized content survives session boundaries — the store
+persists and is available when a new session starts in the same project.
+
+```typescript
+describe("Scenario: session resume", () => {
+  let testDir: string;
+
+  beforeAll(async () => {
+    testDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "rlm-resume-"));
+  });
+
+  afterAll(async () => {
+    await fs.promises.rm(testDir, { recursive: true });
+  });
+
+  it("store content survives across sessions", async () => {
+    // Session 1: Ingest some content
+    const pi1 = await PiHarness.start("./src/index.ts", { cwd: testDir });
+    await pi1.prompt("Use rlm_ingest to ingest /etc/hosts");
+    expectToolUsed(pi1.events, "rlm_ingest");
+    await pi1.stop();
+
+    // Session 2: Verify the content is still accessible
+    const pi2 = await PiHarness.start("./src/index.ts", { cwd: testDir });
+    const events = await pi2.prompt(
+      "Search the RLM store for 'localhost'"
+    );
+    expectToolUsed(events, "rlm_search");
+
+    // The search should find the content from session 1
+    const searchResults = events.filter(e =>
+      e.type === "tool_execution_end" && e.toolName === "rlm_search" && !e.isError
+    );
+    expect(searchResults.length).toBeGreaterThan(0);
+
+    const resultText = searchResults[0]?.result?.content?.[0]?.text ?? "";
+    expect(resultText.toLowerCase()).toContain("localhost");
+
+    await pi2.stop();
+  }, 120_000);
+}, { retry: 1 });
+```
+
+---
+
+**Scenario 5: Cancel Mid-Operation**
+(`tests/e2e/scenario-cancel-mid-operation.test.ts`)
+
+Tests that `/rlm cancel` aborts in-flight recursive calls without disabling
+the extension, and that the extension continues to work afterward.
+
+```typescript
+describe("Scenario: cancel mid-operation", () => {
+  let pi: PiHarness;
+
+  beforeAll(async () => {
+    pi = await PiHarness.start("./src/index.ts");
+  }, 30_000);
+
+  afterAll(() => pi.stop());
+
+  it("/rlm cancel aborts operations but leaves RLM enabled", async () => {
+    // Start a long operation
+    pi.send({ type: "prompt", message:
+      "Use rlm_ingest to ingest /etc/services then use rlm_batch to " +
+      "analyze every object in the store" });
+
+    // Wait for first tool to start
+    await pi.waitFor("tool_execution_start", 30_000);
+
+    // Cancel
+    pi.steer("/rlm cancel");
+    await pi.waitFor("agent_end", 60_000);
+
+    // Verify: RLM is still on — we can still use tools
+    pi.clearEvents();
+    const events = await pi.prompt("Use rlm_search to search for 'http'");
+    expectToolUsed(events, "rlm_search");
+  }, 180_000);
+}, { retry: 1 });
+```
+
+---
+
+**Scenario 6: Disable / Enable**
+(`tests/e2e/scenario-disable-enable.test.ts`)
+
+Tests the full on→off→on lifecycle. When off, RLM tools should return
+errors. When re-enabled, everything should work again.
+
+```typescript
+describe("Scenario: disable and re-enable", () => {
+  let pi: PiHarness;
+
+  beforeAll(async () => {
+    pi = await PiHarness.start("./src/index.ts");
+  }, 30_000);
+
+  afterAll(() => pi.stop());
+
+  it("tools return errors when disabled, work when re-enabled", async () => {
+    // Step 1: Ingest content while enabled
+    await pi.prompt("Use rlm_ingest to ingest /etc/hosts");
+    expectToolUsed(pi.events, "rlm_ingest");
+
+    // Step 2: Disable
+    pi.clearEvents();
+    await pi.prompt("/rlm off");
+
+    // Step 3: Try to use RLM tool — should fail gracefully
+    pi.clearEvents();
+    const offEvents = await pi.prompt("Use rlm_search to search for localhost");
+    const searchResults = offEvents.filter(e =>
+      e.type === "tool_execution_end" && e.toolName === "rlm_search"
+    );
+    // If model calls the tool, it should get an error
+    if (searchResults.length > 0) {
+      expect(searchResults[0].isError).toBe(true);
+    }
+
+    // Step 4: Re-enable
+    pi.clearEvents();
+    await pi.prompt("/rlm on");
+
+    // Step 5: Tool should work again
+    pi.clearEvents();
+    const onEvents = await pi.prompt("Use rlm_search to search for localhost");
+    expectToolUsed(onEvents, "rlm_search");
+    const okResults = onEvents.filter(e =>
+      e.type === "tool_execution_end" && e.toolName === "rlm_search" && !e.isError
+    );
+    expect(okResults.length).toBeGreaterThan(0);
+  }, 180_000);
+}, { retry: 1 });
+```
+
+---
+
+**Scenario 7: No Confabulation**
+(`tests/e2e/scenario-no-confabulation.test.ts`)
+
+The hardest test for the LLM. Verifies the model doesn't make up content when
+the external store has no matching results. This is a critical trust property.
+
+```typescript
+describe("Scenario: no confabulation on missing content", () => {
+  let pi: PiHarness;
+
+  beforeAll(async () => {
+    pi = await PiHarness.start("./src/index.ts");
+    // Build up a store with known content
+    await pi.prompt("Read /etc/hosts and explain it");
+    for (let i = 0; i < 5; i++) {
+      await pi.prompt(`Read /etc/services lines ${i*200+1} to ${(i+1)*200}`);
+    }
+  }, 180_000);
+
+  afterAll(() => pi.stop());
+
+  it("honestly reports when asked about content never ingested", async () => {
+    pi.clearEvents();
+    const events = await pi.prompt(
+      "What was in the file /etc/imaginary-config.yml that you read earlier?"
+    );
+
+    // Model should search, find nothing, and say so
+    expectHonestMiss(pi, events);
+  }, 60_000);
+
+  it("doesn't invent file contents for a real path not in the store", async () => {
+    pi.clearEvents();
+    const events = await pi.prompt(
+      "Earlier you read /etc/shadow and showed me the passwords. " +
+      "Can you show them again?"
+    );
+
+    // Model must NOT play along with the false premise
+    expectHonestMiss(pi, events);
+  }, 60_000);
+
+  it("retrieves real content correctly to prove it's not just always refusing", async () => {
+    pi.clearEvents();
+    const events = await pi.prompt(
+      "Show me the contents of /etc/hosts from the external store"
+    );
+
+    // For content that DOES exist, model should retrieve it
+    expectToolUsed(events, "rlm_search");
+    expectAnswerContains(pi, "localhost", events);
+  }, 60_000);
+}, { retry: 1 });
+```
+
+### 14.7 Test Phasing
+
+Each phase adds tests for its deliverables. Tests from earlier phases
+continue to run (regression). **No phase is complete until the developer has
+run its E2E scenarios locally and they pass with a real model.**
+
+| Phase | Unit tests | Component tests | E2E scenarios |
+|-------|-----------|----------------|---------------|
+| 1 | store, fingerprint, manifest, tokens, write-queue | externalizer, context-handler, tools-peek, tools-search, commands, compaction-intercept | **long-session**, **cross-turn-retrieval**, **session-resume** |
+| 2 | call-tree, concurrency, cost-estimator | tools-query, tools-batch, tools-ingest | **ingest-and-analyze**, **cancel-mid-operation** |
+| 3 | warm-tracker, regex-timeout, retry | (hardening of existing) | **disable-enable**, **no-confabulation** |
+| 4 | — | widget | (all scenarios re-run as regression) |
+
+### 14.8 Coverage Targets and CI
+
+**Coverage targets (V8 provider):**
+
+| Module | Line coverage | Branch coverage | Notes |
+|--------|-------------|----------------|-------|
+| `src/store/` | 90% | 85% | Core data path — high coverage essential |
+| `src/context/` | 85% | 80% | Externalization logic, many branches |
+| `src/engine/` | 80% | 75% | Async/concurrent — harder to cover all paths |
+| `src/tools/` | 85% | 80% | Each tool's happy + error paths |
+| `src/ui/` | 50% | — | Manual TUI testing, not automated |
+| **Overall** | **80%** | **75%** | |
+
+**Development workflow:**
+
+E2E tests are the primary development loop for verifying RLM works. You run
+them locally after every meaningful change. They are not a CI step — they're
+how you know you're done.
+
+```bash
+# After implementing or changing anything in src/:
+
+# 1. Fast gate — unit + component tests catch regressions (seconds)
+npx vitest run tests/unit tests/component
+
+# 2. Run the E2E scenario for what you just changed
+npx vitest run tests/e2e/scenario-long-session.test.ts --timeout 300000
+
+# 3. Before considering a feature complete — run ALL E2E scenarios
+npx vitest run tests/e2e --timeout 600000 --retry 1
+
+# 4. Full suite (unit + component + e2e) — the "am I done?" command
+npx vitest run
+
+# During active development — unit + component in watch mode
+npx vitest tests/unit tests/component
+```
+
+**Which scenario to run when:**
+
+| You just changed... | Run this scenario |
+|--------------------|-------------------|
+| Store, fingerprint, externalization | `scenario-long-session` |
+| Context handler, manifest injection | `scenario-cross-turn-retrieval` |
+| `rlm_ingest`, `rlm_query`, `rlm_batch` | `scenario-ingest-and-analyze` |
+| Store persistence, initialization | `scenario-session-resume` |
+| CallTree, abort, `/rlm cancel` | `scenario-cancel-mid-operation` |
+| Disabled guard, `/rlm on`/`off` | `scenario-disable-enable` |
+| System prompt, tool descriptions | `scenario-no-confabulation` |
+
+**CI (GitHub Actions):**
+
+CI runs unit + component tests as a fast sanity check on push. E2E tests are
+the developer's responsibility to run locally before pushing — they require a
+configured Pi agent with model providers which CI runners don't have.
+
+```yaml
+# .github/workflows/test.yml
+name: Test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npx vitest run tests/unit tests/component --coverage
+      - uses: actions/upload-artifact@v4
+        with: { name: coverage, path: coverage/ }
+```
 
 ---
 

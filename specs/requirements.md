@@ -639,6 +639,46 @@ Pi's model cost metadata (`ctx.modelRegistry`, which provides `cost.input` and
 be the default configuration, consistent with the paper's Pareto-efficient
 economics.
 
+### NFR-6: Testing
+
+**NFR-6.1** [MUST] All core modules (store, fingerprint, manifest, call tree,
+concurrency limiter, cost estimator, warm tracker, write queue) **must** have
+unit tests with ≥80% line coverage and ≥75% branch coverage.
+
+**NFR-6.2** [MUST] Component tests **must** verify the context handler's
+externalization/stubbing logic, each tool's happy path and error paths, and
+command execution — using mock Pi API factories (no live Pi process required).
+
+**NFR-6.3** [MUST] E2E scenario tests **must** run against a real Pi process
+(via `pi --mode rpc -e ./src/index.ts`) with a real LLM and verify the complete
+RLM lifecycle: externalization → stub → manifest injection → retrieval via
+tools → correct answer. The following scenarios **must** pass:
+
+- **Long session** — externalization + retrieval after many turns
+- **Cross-turn retrieval** — content from 10+ turns back retrieved correctly
+- **Ingest + analyze** — `rlm_ingest` a codebase, `rlm_query`/`rlm_batch` it
+- **Session resume** — store content persists and is accessible in a new session
+- **Cancel mid-operation** — `/rlm cancel` aborts without disabling the extension
+- **Disable / enable** — tools error when off, work when re-enabled
+- **No confabulation** — model reports "not found" for missing content, retrieves
+  content that IS present (proving it's not just always refusing)
+
+**NFR-6.4** [MUST] E2E tests **must** use behavioral assertions (tool
+selection, answer containment, event presence) — not exact string matching.
+Each E2E test **must** allow 1 automatic retry to account for model
+non-determinism.
+
+**NFR-6.5** [MUST] E2E scenario tests **must** be run locally by the developer
+during development — not deferred to CI. They are the primary quality gate for
+verifying that RLM works end-to-end with real models. CI runs unit + component
+tests as a fast sanity check; E2E verification is the developer's
+responsibility before pushing.
+
+**NFR-6.6** [MUST] Each implementation phase **must** include its designated
+E2E scenarios and the developer **must** run them locally with a real model
+before considering the phase complete. Earlier phase tests **must** continue
+passing (regression).
+
 ---
 
 ## Traceability Matrix
@@ -651,6 +691,7 @@ economics.
 | 4. Infinite context illusion | FR-2, FR-3.1 (deep copy — user sees originals), FR-3.3 (stubs LLM-only), FR-3.6, FR-3.9, FR-4, FR-5, FR-9.2 (default on), FR-11 (incl. FR-11.4 proactive recovery), FR-12 (session persistence/resume), FR-13, FR-14, NFR-2 (performance — seamlessness requires low latency), NFR-4.2 |
 | 5. Full observability and control | FR-6, FR-7, FR-8, FR-9, FR-10, NFR-3 (reliability), NFR-4, NFR-5 |
 | 6. Security is external | A-3 |
+| 7. Quality assurance | NFR-6 (all) |
 
 | Vision Success Criterion | Requirements |
 |-------------------------|--------------|
