@@ -1,0 +1,34 @@
+{
+  "name": "pi-rlm",
+  "version": "0.1.0",
+  "description": "Pi extension for Recursive Language Model context management",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest --coverage"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "latest",
+    "@mariozechner/pi-ai": "latest",
+    "@mariozechner/pi-tui": "latest",
+    "@sinclair/typebox": "latest",
+    "@types/node": "^22",
+    "typescript": "^5.3",
+    "vitest": "^1"
+  },
+  "keywords": ["pi", "extension", "rlm", "context", "externalization"],
+  "author": "",
+  "license": "MIT"
+}
