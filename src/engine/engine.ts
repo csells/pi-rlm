@@ -146,6 +146,8 @@ function sleep(ms: number): Promise<void> {
  * NOTE: This function requires `complete()` from @mariozechner/pi-ai to be available
  * in the calling scope. Since pi-ai types aren't directly imported to avoid circular
  * dependencies, we use dynamic typing (any) for the complete() function signature.
+ * 
+ * Returns both the text response and accumulated token counts.
  */
 async function runChildAgentLoop(
   model: Model,
@@ -158,7 +160,7 @@ async function runChildAgentLoop(
   maxTokens: number,
   toolHandlers: Map<string, ToolHandler>,
   maxTurns: number = 5,
-): Promise<string> {
+): Promise<{ text: string; tokensIn: number; tokensOut: number }> {
   // Import complete() dynamically to avoid compile-time dependency on pi-ai
   // In production, pi-ai must be installed and available
   let complete: any;
@@ -167,15 +169,25 @@ async function runChildAgentLoop(
     complete = module.complete;
   } catch (err) {
     console.error("[pi-rlm] Could not load pi-ai module — complete() unavailable");
-    return '{"answer": "Error: pi-ai not available", "confidence": "low", "evidence": []}';
+    return {
+      text: '{"answer": "Error: pi-ai not available", "confidence": "low", "evidence": []}',
+      tokensIn: 0,
+      tokensOut: 0,
+    };
   }
 
   let messages = [...context.messages];
   let turns = 0;
+  let totalTokensIn = 0;
+  let totalTokensOut = 0;
 
   while (turns < maxTurns) {
     if (signal.aborted) {
-      return '{"answer": "Aborted by user", "confidence": "low", "evidence": []}';
+      return {
+        text: '{"answer": "Aborted by user", "confidence": "low", "evidence": []}',
+        tokensIn: totalTokensIn,
+        tokensOut: totalTokensOut,
+      };
     }
 
     try {
@@ -190,13 +202,21 @@ async function runChildAgentLoop(
         { signal, maxTokens },
       );
 
+      // Accumulate token counts from response
+      totalTokensIn += response.usage?.inputTokens ?? 0;
+      totalTokensOut += response.usage?.outputTokens ?? 0;
+
       // Extract text and tool calls from response.content array
       const textParts = response.content?.filter((c: any) => c.type === "text") ?? [];
       const toolCalls = response.content?.filter((c: any) => c.type === "toolCall") ?? [];
 
       // If no tool calls, return the text response
       if (toolCalls.length === 0) {
-        return textParts.map((c: any) => c.text).join("");
+        return {
+          text: textParts.map((c: any) => c.text).join(""),
+          tokensIn: totalTokensIn,
+          tokensOut: totalTokensOut,
+        };
       }
 
       // Add the assistant message to messages
@@ -236,7 +256,11 @@ async function runChildAgentLoop(
       turns++;
     } catch (err) {
       if (signal.aborted) {
-        return '{"answer": "Aborted by user", "confidence": "low", "evidence": []}';
+        return {
+          text: '{"answer": "Aborted by user", "confidence": "low", "evidence": []}',
+          tokensIn: totalTokensIn,
+          tokensOut: totalTokensOut,
+        };
       }
       // Re-throw to be caught by query() for rate limit handling
       throw err;
@@ -250,10 +274,20 @@ async function runChildAgentLoop(
       .filter((c: any) => c.type === "text")
       .map((c: any) => c.text)
       .join("");
-    if (text) return text;
+    if (text) {
+      return {
+        text,
+        tokensIn: totalTokensIn,
+        tokensOut: totalTokensOut,
+      };
+    }
   }
 
-  return '{"answer": "Max turns reached without completion", "confidence": "low", "evidence": []}';
+  return {
+    text: '{"answer": "Max turns reached without completion", "confidence": "low", "evidence": []}',
+    tokensIn: totalTokensIn,
+    tokensOut: totalTokensOut,
+  };
 }
 
 /**
@@ -459,7 +493,7 @@ export class RecursiveEngine {
     // 5. Resolve child model
     const childModel = resolveChildModel(modelOverride, this.config, ctx);
     if (!childModel) {
-      const result = { answer: "No model available for recursive call", confidence: "low", evidence: [] };
+      const result = { answer: "No model available for recursive call", confidence: "low" as const, evidence: [] };
       this.callTree.updateCall(callId, { status: "error" });
       return result;
     }
@@ -507,10 +541,12 @@ export class RecursiveEngine {
     const startTime = Date.now();
     let result: ChildCallResult;
     let status: "success" | "error" | "timeout" | "cancelled" = "success";
+    let tokensIn = 0;
+    let tokensOut = 0;
 
     try {
       // Run the child agent loop with tool support
-      const responseText = await runChildAgentLoop(
+      const response = await runChildAgentLoop(
         childModel,
         { systemPrompt, messages, tools },
         childController.signal,
@@ -519,14 +555,35 @@ export class RecursiveEngine {
         5,
       );
 
-      result = parseChildResult(responseText);
+      result = parseChildResult(response.text);
+      tokensIn = response.tokensIn;
+      tokensOut = response.tokensOut;
       status = "success";
     } catch (err) {
       if (childController.signal.aborted) {
         result = { answer: "Timed out or cancelled", confidence: "low", evidence: [] };
         status = operationSignal.aborted ? "cancelled" : "timeout";
       } else if (isRateLimitError(err)) {
-        const retried = await retryWithBackoff(() => Promise.resolve(parseChildResult("")));
+        // Retry with backoff: create a fresh AbortController+timeout and re-invoke runChildAgentLoop
+        const retried = await retryWithBackoff(async () => {
+          const retryController = new AbortController();
+          const retryTimeout = setTimeout(() => retryController.abort(), this.config.childTimeoutSec * 1000);
+          try {
+            const retryResponse = await runChildAgentLoop(
+              childModel,
+              { systemPrompt, messages, tools },
+              retryController.signal,
+              this.config.childMaxTokens,
+              toolHandlers,
+              5,
+            );
+            tokensIn += retryResponse.tokensIn;
+            tokensOut += retryResponse.tokensOut;
+            return parseChildResult(retryResponse.text);
+          } finally {
+            clearTimeout(retryTimeout);
+          }
+        });
         result = retried || { answer: "Rate limit exceeded after retries", confidence: "low", evidence: [] };
         status = retried ? "success" : "error";
       } else {
@@ -550,20 +607,23 @@ export class RecursiveEngine {
       query: instructions,
       targetIds,
       result,
-      tokensIn: 0, // Will be populated by complete()
-      tokensOut: 0, // Will be populated by complete()
+      tokensIn,
+      tokensOut,
       wallClockMs,
       status,
       timestamp: Date.now(),
     });
 
-    // 11. Update callTree
-    this.callTree.updateCall(callId, { status, wallClockMs });
+    // 11. Update callTree with token counts
+    this.callTree.updateCall(callId, { status, wallClockMs, tokensIn, tokensOut });
 
-    // 12. Mark content as warm
+    // 12. Add call cost to estimator
+    this.costEstimator.addCallCost(tokensIn, tokensOut, childModel);
+
+    // 13. Mark content as warm
     this.warmTracker.markWarm(targetIds);
 
-    // 13. Return result
+    // 14. Return result
     return result;
   }
 
@@ -589,7 +649,7 @@ export class RecursiveEngine {
     const results = await this.concurrencyLimiter.map(tasks, async (task) => {
       // Per-operation budget check
       if (!this.callTree.incrementChildCalls(operationId)) {
-        return { answer: "Budget exceeded", confidence: "low", evidence: [] };
+        return { answer: "Budget exceeded", confidence: "low" as const, evidence: [] };
       }
 
       return await this.query(task.instructions, [task.targetId], parentCallId, depth, operationId, operationSignal, ctx, modelOverride);

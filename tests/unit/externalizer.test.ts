@@ -8,7 +8,6 @@ import {
   AgentMessage,
   externalize,
   ExternalizerState,
-  externalizedMessages,
   forceExternalize,
   messageFingerprint,
   onBeforeCompact,
@@ -24,6 +23,7 @@ class MockStore implements IExternalStore {
   private records = new Map<string, StoreRecord>();
   private ids: string[] = [];
   private seq = 0;
+  private externalizedMap = new Map<string, string>();
 
   get(id: string): StoreRecord | null {
     return this.records.get(id) ?? null;
@@ -90,7 +90,21 @@ class MockStore implements IExternalStore {
   }
 
   rebuildExternalizedMap(): void {
-    // no-op for mock
+    this.externalizedMap.clear();
+    for (const id of this.ids) {
+      const rec = this.records.get(id);
+      if (rec?.source.kind === "externalized" && rec.source.fingerprint) {
+        this.externalizedMap.set(rec.source.fingerprint, rec.id);
+      }
+    }
+  }
+
+  getExternalizedId(fingerprint: string): string | null {
+    return this.externalizedMap.get(fingerprint) ?? null;
+  }
+
+  addExternalized(fingerprint: string, objectId: string): void {
+    this.externalizedMap.set(fingerprint, objectId);
   }
 }
 
@@ -121,7 +135,7 @@ function createState(store: MockStore): ExternalizerState {
 
 describe("externalizer algorithms", () => {
   beforeEach(() => {
-    externalizedMessages.clear();
+    // Store now manages externalized messages internally
   });
 
   it("replaceContentWithStub preserves assistant tool_use blocks", () => {
@@ -161,7 +175,7 @@ describe("externalizer algorithms", () => {
       content: "original text",
       source: { kind: "externalized", fingerprint: messageFingerprint(msg) },
     });
-    externalizedMessages.set(messageFingerprint(msg), rec.id);
+    store.addExternalized(messageFingerprint(msg), rec.id);
 
     replaceExternalizedWithStubs([msg], store);
 
@@ -279,7 +293,7 @@ describe("externalizer algorithms", () => {
 
 describe("context handlers", () => {
   beforeEach(() => {
-    externalizedMessages.clear();
+    // Store now manages externalized messages internally
   });
 
   it("onContext performs phase-0 stub replacement even when tokens are null", async () => {
@@ -299,7 +313,7 @@ describe("context handlers", () => {
       content: "old assistant content",
       source: { kind: "externalized", fingerprint: messageFingerprint(oldAssistant) },
     });
-    externalizedMessages.set(messageFingerprint(oldAssistant), rec.id);
+    store.addExternalized(messageFingerprint(oldAssistant), rec.id);
 
     const result = await onContext(
       {

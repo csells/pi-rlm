@@ -12,7 +12,6 @@ import {
   ExternalizerState,
   onBeforeCompact,
   onContext,
-  rebuildExternalizedMessagesFromStore,
 } from "./context/externalizer.js";
 import { ManifestBuilder } from "./context/manifest.js";
 import { WarmTracker } from "./context/warm-tracker.js";
@@ -215,7 +214,6 @@ export async function onSessionStart(
 
   // Rebuild in-memory fingerprint -> object map for stub replacement
   state.store.rebuildExternalizedMap();
-  rebuildExternalizedMessagesFromStore(state.store);
 
   await maybeShowFirstRunNotification(ctx);
 

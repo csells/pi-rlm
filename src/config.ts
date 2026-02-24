@@ -1,32 +1,10 @@
 /**
  * RlmConfig and default configuration for Pi-RLM.
- * This module defines the configuration schema and default values.
+ * This module defines the default values and merge utility.
+ * RlmConfig interface is defined in types.ts (the canonical source).
  */
 
-export interface RlmConfig {
-  // Core feature toggles
-  enabled: boolean;               // Default: true
-
-  // Externalization parameters
-  maxDepth: number;               // Default: 2
-  maxConcurrency: number;         // Default: 4
-  tokenBudgetPercent: number;     // Default: 60
-  safetyValvePercent: number;     // Default: 90
-  manifestBudget: number;         // Default: 2000 (tokens)
-  warmTurns: number;              // Default: 3
-
-  // Recursive call parameters
-  childTimeoutSec: number;        // Default: 120
-  operationTimeoutSec: number;    // Default: 600
-  maxChildCalls: number;          // Default: 50
-  childMaxTokens: number;         // Default: 4096
-  childModel?: string;            // Optional: "provider/model-id" for children
-
-  // Store management
-  retentionDays: number;          // Default: 30
-  maxIngestFiles: number;         // Default: 1000 — per-invocation file cap
-  maxIngestBytes: number;         // Default: 100_000_000 (100MB) — per-invocation size cap
-}
+import type { RlmConfig } from "./types.js";
 
 export const DEFAULT_CONFIG: RlmConfig = {
   enabled: true,

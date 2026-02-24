@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { StoreRecord, StoreIndex, StoreIndexEntry, ContentType, StoreObjectSource } from "./types.js";
+import type { StoreRecord, StoreIndex, StoreIndexEntry, ContentType, StoreObjectSource } from "../types.js";
 import { WriteQueue } from "./write-queue.js";
 
 /**

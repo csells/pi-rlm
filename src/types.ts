@@ -14,6 +14,17 @@ export interface ChildCallResult {
   evidence: string[];
 }
 
+/**
+ * A match result from rlm_search.
+ */
+export interface SearchMatch {
+  objectId: string;
+  offset: number;                 // Character offset of match in object content
+  snippet: string;                // The matched text
+  context: string;                // ±100 chars surrounding the match
+  error?: string;                 // Present if search failed for this object
+}
+
 // ============================================================================
 // Extension Context (placeholder for pi-ai types)
 // ============================================================================
@@ -87,6 +98,8 @@ export interface IExternalStore {
   flush(): Promise<void>;
   clear?(): Promise<void>;
   rebuildExternalizedMap(): void;
+  getExternalizedId(fingerprint: string): string | null;
+  addExternalized(fingerprint: string, objectId: string): void;
 }
 
 // ============================================================================
@@ -139,6 +152,18 @@ export interface IWarmTracker {
   isWarm(objectId: string): boolean;
   isToolCallWarm(toolCallId: string): boolean;
   tick(): void;
+}
+
+// ============================================================================
+// TokenOracle Types (from task-4: TokenOracle)
+// ============================================================================
+
+export interface ITokenOracle {
+  observe(charCount: number, actualTokens: number): void;
+  estimate(charCount: number): number;
+  estimateSafe(charCount: number, coverage?: number): number;
+  isCold(): boolean;
+  getStats(): { observationCount: number; meanRatio: number; coverage95Quantile: number };
 }
 
 // ============================================================================

@@ -290,47 +290,8 @@ function estimateMessageTokens(msg: AgentMessage): number {
 // Externalization Tracking
 // ============================================================================
 
-/**
- * fingerprint -> objectId map for content externalized in this/previous turns.
- */
-export const externalizedMessages = new Map<string, string>();
-
-/**
- * Rebuild externalizedMessages from persisted records.
- */
-export function rebuildExternalizedMap(
-  storeRecords: Array<{ id: string; source: { kind: string; fingerprint?: string } }>,
-): void {
-  externalizedMessages.clear();
-  for (const record of storeRecords) {
-    if (record.source.kind === "externalized" && record.source.fingerprint) {
-      externalizedMessages.set(record.source.fingerprint, record.id);
-    }
-  }
-}
-
-/**
- * Rebuild externalizedMessages directly from the store interface.
- */
-export function rebuildExternalizedMessagesFromStore(store: IExternalStore): void {
-  const records: Array<{ id: string; source: { kind: string; fingerprint?: string } }> = [];
-
-  for (const id of store.getAllIds()) {
-    const rec = store.get(id);
-    if (!rec) continue;
-
-    if (rec.source.kind === "externalized") {
-      records.push({
-        id: rec.id,
-        source: { kind: "externalized", fingerprint: rec.source.fingerprint },
-      });
-    } else {
-      records.push({ id: rec.id, source: { kind: rec.source.kind } });
-    }
-  }
-
-  rebuildExternalizedMap(records);
-}
+// Externalization tracking is now managed by ExternalStore via getExternalizedId()
+// and addExternalized() methods. No module-level mutable state needed.
 
 // ============================================================================
 // Stub Replacement
@@ -371,7 +332,7 @@ export function replaceContentWithStub(msg: AgentMessage, entry: StubEntry): voi
 export function replaceExternalizedWithStubs(messages: AgentMessage[], store: IExternalStore): void {
   for (const msg of messages) {
     const fp = messageFingerprint(msg);
-    const objectId = externalizedMessages.get(fp);
+    const objectId = store.getExternalizedId(fp);
     if (!objectId) continue;
 
     const entry = store.getIndexEntry(objectId);
@@ -423,7 +384,7 @@ export function externalize(
     if (hasWarmToolResult) continue;
 
     const hasWarmSourceObject = group.fingerprints.some((fp) => {
-      const objectId = externalizedMessages.get(fp);
+      const objectId = state.store.getExternalizedId(fp);
       return objectId ? state.warmTracker.isWarm(objectId) : false;
     });
     if (hasWarmSourceObject) continue;
@@ -454,7 +415,7 @@ export function externalize(
       const message = candidate.group.messages[i];
       const fingerprint = candidate.group.fingerprints[i];
 
-      if (externalizedMessages.has(fingerprint)) continue;
+      if (state.store.getExternalizedId(fingerprint)) continue;
       if (isStubContent(message)) continue;
 
       const content = extractContent(message);
@@ -469,7 +430,7 @@ export function externalize(
         source: { kind: "externalized", fingerprint },
       });
 
-      externalizedMessages.set(fingerprint, obj.id);
+      state.store.addExternalized(fingerprint, obj.id);
       replaceContentWithStub(message, obj);
 
       objectIds.push(obj.id);
@@ -527,7 +488,7 @@ export function forceExternalize(
       const fingerprint = group.fingerprints[i];
 
       if (message.role === "system") continue;
-      if (externalizedMessages.has(fingerprint)) continue;
+      if (state.store.getExternalizedId(fingerprint)) continue;
       if (isStubContent(message)) continue;
 
       const content = extractContent(message);
@@ -542,7 +503,7 @@ export function forceExternalize(
         source: { kind: "externalized", fingerprint },
       });
 
-      externalizedMessages.set(fingerprint, obj.id);
+      state.store.addExternalized(fingerprint, obj.id);
       replaceContentWithStub(message, obj);
 
       objectIds.push(obj.id);

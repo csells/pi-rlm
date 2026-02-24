@@ -6,9 +6,30 @@
 import { Worker } from "node:worker_threads";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { formatSearchResults, type SearchMatch } from "../store/types.js";
+import type { SearchMatch } from "../types.js";
 import type { ExtensionContext, IExternalStore, ITrajectoryLogger, IWarmTracker } from "../types.js";
 import { disabledGuard, errorResult, successResult, type ToolResult } from "./guard.js";
+
+/**
+ * Format search results into a human-readable string.
+ * Used by rlm_search tool to present results to the LLM.
+ */
+function formatSearchResults(matches: SearchMatch[]): string {
+  if (matches.length === 0) {
+    return "No matches found.";
+  }
+
+  const lines: string[] = [`Found ${matches.length} match(es):\n`];
+  for (const m of matches) {
+    if (m.error) {
+      lines.push(`**${m.objectId}**: ${m.error}`);
+    } else {
+      lines.push(`**${m.objectId}** [offset ${m.offset}]:`);
+      lines.push(`  ...${m.context}...`);
+    }
+  }
+  return lines.join("\n");
+}
 
 export const RLM_SEARCH_PARAMS_SCHEMA = Type.Object({
   pattern: Type.String({ description: "Search pattern (substring or /regex/flags)" }),

@@ -6,7 +6,12 @@
  * - countMessageTokensSafe: chars/3 estimate for safety valve (conservative)
  *
  * Image blocks are estimated at 1000 tokens each (conservative).
+ *
+ * When a TokenOracle is provided and warmed (10+ observations), uses oracle estimates
+ * instead of hardcoded ratios.
  */
+
+import type { ITokenOracle } from "../types.js";
 
 export interface Message {
   role: string;
@@ -18,6 +23,9 @@ export interface ContentBlock {
   text?: string;
 }
 
+// Re-export ITokenOracle for convenience
+export type { ITokenOracle };
+
 /**
  * Count tokens in a message array using chars/4 estimation.
  * Used for the normal externalization threshold check (FR-3.2).
@@ -26,22 +34,44 @@ export interface ContentBlock {
  * - Text blocks: estimate as character count / 4
  * - Image blocks: not counted (passed through unchanged)
  * - String content: character count / 4
+ *
+ * When oracle is provided and warmed (10+ observations), uses oracle.estimate()
+ * instead of hardcoded ratio.
+ *
+ * @param messages - Message array to count
+ * @param oracle - Optional TokenOracle for self-calibrating estimates
  */
-export function countMessageTokens(messages: Message[]): number {
+export function countMessageTokens(messages: Message[], oracle?: ITokenOracle): number {
   let total = 0;
+  let totalChars = 0;
 
   for (const msg of messages) {
     if (typeof msg.content === "string") {
-      // String content
+      totalChars += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "text" && block.text) {
+          totalChars += block.text.length;
+        }
+      }
+    }
+  }
+
+  // Use oracle estimate if available and warmed
+  if (oracle && !oracle.isCold()) {
+    return oracle.estimate(totalChars);
+  }
+
+  // Fallback to chars/4
+  total = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
       total += Math.ceil(msg.content.length / 4);
     } else if (Array.isArray(msg.content)) {
-      // Content blocks
       for (const block of msg.content) {
         if (block.type === "text" && block.text) {
           total += Math.ceil(block.text.length / 4);
         }
-        // Image and other non-text blocks are not counted here
-        // (passed through unchanged, not externalized)
       }
     }
   }
@@ -60,27 +90,43 @@ export function countMessageTokens(messages: Message[]): number {
  * - Text blocks: estimate as character count / 3 (more conservative)
  * - Image blocks: estimate as 1000 tokens each (conservative)
  * - String content: character count / 3
+ *
+ * When oracle is provided and warmed (10+ observations), uses oracle.estimateSafe()
+ * instead of hardcoded chars/3 ratio.
+ *
+ * @param messages - Message array to count
+ * @param oracle - Optional TokenOracle for self-calibrating estimates
  */
-export function countMessageTokensSafe(messages: Message[]): number {
+export function countMessageTokensSafe(messages: Message[], oracle?: ITokenOracle): number {
   let total = 0;
+  let totalChars = 0;
+  let imageCount = 0;
 
+  // First pass: count characters and images
   for (const msg of messages) {
     if (typeof msg.content === "string") {
-      // String content
-      total += Math.ceil(msg.content.length / 3);
+      totalChars += msg.content.length;
     } else if (Array.isArray(msg.content)) {
-      // Content blocks
       for (const block of msg.content) {
         if (block.type === "text" && block.text) {
-          total += Math.ceil(block.text.length / 3);
+          totalChars += block.text.length;
         } else if (block.type === "image") {
-          // Conservative estimate for image blocks
-          total += 1000;
+          imageCount += 1;
         }
-        // Other non-text blocks are not counted
       }
     }
   }
+
+  // Use oracle estimate if available and warmed
+  if (oracle && !oracle.isCold()) {
+    total = oracle.estimateSafe(totalChars);
+  } else {
+    // Fallback to chars/3
+    total = Math.ceil(totalChars / 3);
+  }
+
+  // Add image tokens (conservative: 1000 per image)
+  total += imageCount * 1000;
 
   return total;
 }
