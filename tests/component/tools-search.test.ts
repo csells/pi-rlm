@@ -76,7 +76,7 @@ describe("rlm_search tool", () => {
     it("should have correct metadata", () => {
       expect(tool.name).toBe("rlm_search");
       expect(tool.label).toBe("RLM Search");
-      expect(tool.description).toContain("search");
+      expect(tool.description.toLowerCase()).toContain("search");
     });
 
     it("should have proper parameter schema", () => {

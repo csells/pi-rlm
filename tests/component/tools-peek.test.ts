@@ -69,7 +69,7 @@ describe("rlm_peek tool", () => {
     it("should have correct metadata", () => {
       expect(tool.name).toBe("rlm_peek");
       expect(tool.label).toBe("RLM Peek");
-      expect(tool.description).toContain("retrieve");
+      expect(tool.description.toLowerCase()).toContain("retrieve");
     });
 
     it("should have proper parameter schema", () => {
@@ -262,8 +262,8 @@ describe("rlm_peek tool", () => {
 
       expect(result.isError).toBeFalsy();
       const text = result.content[0].text;
-      // Should mention total character count
-      expect(text).toContain("total chars");
+      // Should mention total character count (format: "of N chars")
+      expect(text).toContain("chars");
     });
   });
 

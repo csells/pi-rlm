@@ -136,7 +136,7 @@ describe("rlm_ingest tool", () => {
 
     it("should skip binary files (containing null bytes)", async () => {
       const filePath = path.join(testDir, "binary.bin");
-      const binaryContent = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+      const binaryContent = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x00, 0x00]);
       await fs.promises.writeFile(filePath, binaryContent);
 
       const result = await tool.execute(
