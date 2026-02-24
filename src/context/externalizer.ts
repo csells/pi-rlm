@@ -13,6 +13,7 @@ import { emitEvent } from "../events.js";
 import type {
   ExtensionContext,
   IExternalStore,
+  ITokenOracle,
   ITrajectoryLogger,
   IWarmTracker,
   RlmConfig,
@@ -70,6 +71,7 @@ export interface ExternalizerState {
   allowCompaction: boolean;
   forceExternalizeOnNextTurn: boolean;
   trajectory?: ITrajectoryLogger;
+  oracle?: ITokenOracle;
   updateWidget?: (ctx: ExtensionContext) => void;
 }
 
@@ -581,12 +583,31 @@ export async function onContext(
 
   const usage = ctx.getContextUsage?.();
 
+  // Observe actual token usage if oracle is available
+  if (state.oracle && usage && usage.tokens !== null && messages.length > 0) {
+    // Count actual characters in messages
+    let totalChars = 0;
+    for (const msg of messages) {
+      if (typeof msg.content === "string") {
+        totalChars += msg.content.length;
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "text" && block.text) {
+            totalChars += block.text.length;
+          }
+        }
+      }
+    }
+    // Record the observation for calibration
+    state.oracle.observe(totalChars, usage.tokens);
+  }
+
   if (usage && usage.tokens !== null) {
     const threshold = usage.contextWindow * (state.config.tokenBudgetPercent / 100);
     const safetyThreshold = usage.contextWindow * (state.config.safetyValvePercent / 100);
 
     // Phase 1: Normal pass
-    const postStubTokens = countMessageTokens(messages);
+    const postStubTokens = countMessageTokens(messages, state.oracle);
     if (state.forceExternalizeOnNextTurn || postStubTokens > threshold) {
       state.activePhases.add("externalizing");
       state.updateWidget?.(ctx);
@@ -603,11 +624,11 @@ export async function onContext(
     injectManifest(messages, state);
 
     // Phase 3: Safety valve
-    const postManifestTokens = countMessageTokensSafe(messages);
+    const postManifestTokens = countMessageTokensSafe(messages, state.oracle);
     if (postManifestTokens > safetyThreshold) {
       forceExternalize(messages, state, pi);
 
-      const finalTokens = countMessageTokensSafe(messages);
+      const finalTokens = countMessageTokensSafe(messages, state.oracle);
       if (finalTokens > safetyThreshold) {
         state.allowCompaction = true;
       }

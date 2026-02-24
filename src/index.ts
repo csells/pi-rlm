@@ -14,6 +14,7 @@ import {
   onContext,
 } from "./context/externalizer.js";
 import { ManifestBuilder } from "./context/manifest.js";
+import { TokenOracle } from "./context/token-oracle.js";
 import { WarmTracker } from "./context/warm-tracker.js";
 import { CallTree } from "./engine/call-tree.js";
 import { CostEstimator } from "./engine/cost.js";
@@ -49,6 +50,7 @@ export interface RlmState extends ExternalizerState {
   costEstimator: CostEstimator;
   trajectory: ITrajectoryLogger;
   warmTracker: IWarmTracker;
+  oracle: TokenOracle;
   activePhases: Set<string>;
   sessionId: string;
   turnCount: number;
@@ -64,6 +66,7 @@ function createBootstrapState(): RlmState {
   const store = new ExternalStore(storeDir, sessionId);
   const warmTracker = new WarmTracker(DEFAULT_CONFIG.warmTurns);
   const trajectory = new TrajectoryLogger(storeDir);
+  const oracle = new TokenOracle();
   const callTree = new CallTree(DEFAULT_CONFIG.maxChildCalls);
   const costEstimator = new CostEstimator(store);
   const engine = new RecursiveEngine(
@@ -85,6 +88,7 @@ function createBootstrapState(): RlmState {
     costEstimator,
     trajectory,
     warmTracker,
+    oracle,
     activePhases: new Set<string>(),
     sessionId,
     turnCount: 0,
@@ -201,6 +205,7 @@ export async function onSessionStart(
   state.manifest = new ManifestBuilder(store);
   state.warmTracker = new WarmTracker(state.config.warmTurns);
   state.trajectory = new TrajectoryLogger(storeDir);
+  state.oracle = new TokenOracle();
   state.callTree = new CallTree(state.config.maxChildCalls);
   state.costEstimator = new CostEstimator(store);
   state.engine = new RecursiveEngine(
