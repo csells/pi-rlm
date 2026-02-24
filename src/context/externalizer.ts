@@ -160,10 +160,13 @@ export function inferContentType(
 
 /**
  * Generate concise manifest description for a message.
+ *
+ * Per task-3, descriptions are content-type aware:
+ * - toolResult: 'toolName: firstLine - N lines' (firstLine is first non-empty line, N is total line count)
+ * - assistant/user: 'Role: snippet' (snippet truncated at 100 chars, was 80)
+ * - system: 'System: snippet' (unchanged)
  */
 export function generateDescription(msg: AgentMessage): string {
-  const maxLen = 80;
-
   let text = "";
   if (typeof msg.content === "string") {
     text = msg.content;
@@ -174,11 +177,19 @@ export function generateDescription(msg: AgentMessage): string {
       .join(" ");
   }
 
+  // For toolResult messages: format as 'toolName: firstLine - N lines'
+  if (msg.role === "toolResult") {
+    const lines = text.split("\n");
+    const firstNonEmptyLine = lines.find((line) => line.trim().length > 0) || "";
+    const firstLine = firstNonEmptyLine.slice(0, 100).replace(/\n/g, " ");
+    const lineCount = lines.length;
+    return `${msg.toolName || "tool"}: ${firstLine} - ${lineCount} lines`;
+  }
+
+  // For assistant/user: keep 'Role: snippet' format but increase maxLen to 100
+  const maxLen = 100;
   const snippet = text.slice(0, maxLen).replace(/\n/g, " ");
 
-  if (msg.role === "toolResult") {
-    return `${msg.toolName || "tool"}: ${snippet}`;
-  }
   if (msg.role === "assistant") {
     return `Assistant: ${snippet}`;
   }
@@ -602,7 +613,7 @@ export async function onContext(
     state.oracle.observe(totalChars, usage.tokens);
   }
 
-  if (usage && usage.tokens !== null) {
+  if (usage && usage.tokens !== null && ctx.model) {
     const threshold = usage.contextWindow * (state.config.tokenBudgetPercent / 100);
     const safetyThreshold = usage.contextWindow * (state.config.safetyValvePercent / 100);
 

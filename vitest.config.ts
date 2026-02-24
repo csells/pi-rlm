@@ -6,7 +6,7 @@ export default defineConfig({
     globals: true,
     testTimeout: 10_000,
     hookTimeout: 30_000,
-    typecheck: { enabled: false },
+    typecheck: { enabled: true },
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],

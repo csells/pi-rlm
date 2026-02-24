@@ -59,7 +59,7 @@ export class ManifestBuilder {
 
     // Build table header
     const lines: string[] = [
-      "## Externalized Context",
+      "## RLM External Context",
       "",
       "The following content has been externalized to the store. Use `rlm_search`, `rlm_peek`, or `rlm_query` to access.",
       "",

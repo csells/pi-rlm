@@ -4,10 +4,17 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { Type } from "@sinclair/typebox";
 import { CallTree } from "../engine/call-tree.js";
 import { CostEstimator } from "../engine/cost.js";
 import { RecursiveEngine, resolveChildModel } from "../engine/engine.js";
 import { ChildCallResult, ExtensionContext, IExternalStore, IWarmTracker, RlmConfig } from "../types.js";
+
+export const RLM_BATCH_PARAMS_SCHEMA = Type.Object({
+  instructions: Type.String({ description: "What to analyze on each object" }),
+  targets: Type.Array(Type.String(), { description: "Array of object IDs" }),
+  model: Type.Optional(Type.String({ description: "Optional override child model (provider/model-id)" })),
+});
 
 /**
  * Build the rlm_batch tool definition and executor.
@@ -27,25 +34,7 @@ export function buildRlmBatchTool(
     name: "rlm_batch",
     label: "RLM Batch",
     description: "Spawn parallel child LLM calls across multiple externalized objects.",
-    parameters: {
-      type: "object",
-      properties: {
-        instructions: {
-          type: "string",
-          description: "What to analyze on each object",
-        },
-        targets: {
-          type: "array",
-          items: { type: "string" },
-          description: "Array of object IDs",
-        },
-        model: {
-          type: "string",
-          description: "Optional override child model (provider/model-id)",
-        },
-      },
-      required: ["instructions", "targets"],
-    },
+    parameters: RLM_BATCH_PARAMS_SCHEMA,
 
     async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext) {
       if (!enabled()) {

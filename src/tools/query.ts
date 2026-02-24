@@ -4,10 +4,23 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { Type } from "@sinclair/typebox";
 import { CallTree } from "../engine/call-tree.js";
 import { CostEstimator } from "../engine/cost.js";
 import { RecursiveEngine, resolveChildModel } from "../engine/engine.js";
 import { ChildCallResult, ExtensionContext, IExternalStore, IWarmTracker, RlmConfig } from "../types.js";
+
+export const RLM_QUERY_PARAMS_SCHEMA = Type.Object({
+  instructions: Type.String({ description: "What to analyze or answer" }),
+  target: Type.Union(
+    [
+      Type.String({ description: "Single object ID" }),
+      Type.Array(Type.String(), { description: "Array of object IDs" }),
+    ],
+    { description: "Single object ID or array of object IDs" },
+  ),
+  model: Type.Optional(Type.String({ description: "Optional override child model (provider/model-id)" })),
+});
 
 /**
  * Build the rlm_query tool definition and executor.
@@ -27,27 +40,7 @@ export function buildRlmQueryTool(
     name: "rlm_query",
     label: "RLM Query",
     description: "Spawn a recursive child LLM call focused on specific externalized objects.",
-    parameters: {
-      type: "object",
-      properties: {
-        instructions: {
-          type: "string",
-          description: "What to analyze or answer",
-        },
-        target: {
-          description: "Single object ID or array of object IDs",
-          oneOf: [
-            { type: "string", description: "Single object ID" },
-            { type: "array", items: { type: "string" }, description: "Array of object IDs" },
-          ],
-        },
-        model: {
-          type: "string",
-          description: "Optional override child model (provider/model-id)",
-        },
-      },
-      required: ["instructions", "target"],
-    },
+    parameters: RLM_QUERY_PARAMS_SCHEMA,
 
     async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext) {
       if (!enabled()) {

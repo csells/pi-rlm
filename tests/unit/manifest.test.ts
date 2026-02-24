@@ -137,7 +137,7 @@ describe("ManifestBuilder", () => {
       ]);
       builder = new ManifestBuilder(store);
       const manifest = builder.build(500);
-      expect(manifest).toContain("Externalized Context");
+      expect(manifest).toContain("RLM External Context");
       expect(manifest).toContain("Total:");
       expect(manifest).toContain("objects");
       expect(manifest).toContain("tokens externalized");

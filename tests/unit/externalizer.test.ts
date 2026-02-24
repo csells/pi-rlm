@@ -354,7 +354,7 @@ describe("context handlers", () => {
     );
 
     expect(typeof result?.messages[0].content).toBe("string");
-    expect(result?.messages[0].content).toContain("## Externalized Context");
+    expect(result?.messages[0].content).toContain("## RLM External Context");
     expect(result?.messages[0].content).toContain("hello");
   });
 
@@ -379,6 +379,7 @@ describe("context handlers", () => {
       { messages },
       {
         getContextUsage: () => ({ tokens: 950, contextWindow: 1000 }),
+        model: { id: "test-model" },
       } as any,
       state,
     );

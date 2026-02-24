@@ -15,8 +15,10 @@ import {
   IWarmTracker,
   Model,
   RlmConfig,
+  SearchMatch,
 } from "../types.js";
 import { buildChildSystemPrompt } from "../system-prompt.js";
+import { parsePattern, searchWithWorkerTimeout } from "../tools/search.js";
 
 // ============================================================================
 // Helper Types
@@ -161,12 +163,14 @@ async function runChildAgentLoop(
   toolHandlers: Map<string, ToolHandler>,
   maxTurns: number = 5,
 ): Promise<{ text: string; tokensIn: number; tokensOut: number }> {
-  // Import complete() dynamically to avoid compile-time dependency on pi-ai
+  // Import complete() and stream() dynamically to avoid compile-time dependency on pi-ai
   // In production, pi-ai must be installed and available
   let complete: any;
+  let stream: any;
   try {
     const module = await import("@mariozechner/pi-ai");
     complete = module.complete;
+    stream = module.stream;
   } catch (err) {
     console.error("[pi-rlm] Could not load pi-ai module — complete() unavailable");
     return {
@@ -180,6 +184,7 @@ async function runChildAgentLoop(
   let turns = 0;
   let totalTokensIn = 0;
   let totalTokensOut = 0;
+  let useStream = false;
 
   while (turns < maxTurns) {
     if (signal.aborted) {
@@ -191,16 +196,53 @@ async function runChildAgentLoop(
     }
 
     try {
-      // Call complete() with system prompt, messages, and tools
-      const response: any = await complete(
-        model,
-        {
-          systemPrompt: context.systemPrompt,
-          messages,
-          tools: context.tools,
-        },
-        { signal, maxTokens },
-      );
+      let response: any;
+      
+      // If complete() threw "unsupported" on a previous turn, use stream() directly
+      if (useStream) {
+        response = await stream(
+          model,
+          {
+            systemPrompt: context.systemPrompt,
+            messages,
+            tools: context.tools,
+          },
+          { signal, maxTokens },
+        ).result();
+      } else {
+        // Try complete() first
+        try {
+          response = await complete(
+            model,
+            {
+              systemPrompt: context.systemPrompt,
+              messages,
+              tools: context.tools,
+            },
+            { signal, maxTokens },
+          );
+        } catch (err) {
+          // If complete() throws an "unsupported" error, fall back to stream()
+          if (
+            err instanceof Error &&
+            /unsupported|not supported|not implemented/i.test(err.message)
+          ) {
+            useStream = true;
+            response = await stream(
+              model,
+              {
+                systemPrompt: context.systemPrompt,
+                messages,
+                tools: context.tools,
+              },
+              { signal, maxTokens },
+            ).result();
+          } else {
+            // Re-throw non-unsupported errors
+            throw err;
+          }
+        }
+      }
 
       // Accumulate token counts from response
       totalTokensIn += response.usage?.inputTokens ?? 0;
@@ -393,21 +435,67 @@ function buildChildToolHandlers(
   handlers.set("rlm_search", async (args) => {
     const pattern = args.pattern as string;
     const scope = (args.scope as string[]) ?? store.getAllIds();
-    const matches: string[] = [];
+    const allMatches: SearchMatch[] = [];
+    
+    // Parse the pattern into regex or substring mode
+    const parsed = parsePattern(pattern);
+    
     for (const id of scope) {
       const obj = store.get(id);
       if (!obj) continue;
-      // Simple substring search for MVP (regex timeout comes in Phase 3)
-      const index = obj.content.indexOf(pattern);
-      if (index >= 0) {
-        const context = obj.content.slice(Math.max(0, index - 100), index + pattern.length + 100);
-        matches.push(`**${id}** [offset ${index}]:\n  ...${context}...`);
-        if (matches.length >= 50) break;
+      
+      let objectMatches: SearchMatch[] = [];
+      
+      if (parsed.kind === "regex") {
+        // Use worker timeout for regex patterns
+        objectMatches = await searchWithWorkerTimeout(obj.content, parsed.regex, id, 5000);
+      } else {
+        // Use indexOf for substring patterns
+        const needle = parsed.needle;
+        let startAt = 0;
+        while (startAt <= obj.content.length && objectMatches.length < 50) {
+          const index = obj.content.indexOf(needle, startAt);
+          if (index < 0) break;
+          
+          const contextStart = Math.max(0, index - 100);
+          const contextEnd = Math.min(obj.content.length, index + needle.length + 100);
+          
+          objectMatches.push({
+            objectId: id,
+            offset: index,
+            snippet: needle,
+            context: obj.content.slice(contextStart, contextEnd),
+          });
+          
+          startAt = index + Math.max(needle.length, 1);
+        }
+      }
+      
+      allMatches.push(...objectMatches);
+      if (allMatches.length >= 50) {
+        allMatches.length = 50;
+        break;
       }
     }
+    
     warmTracker.markWarm(scope);
-    const result = matches.length === 0 ? "No matches found." : `Found ${matches.length} match(es):\n${matches.join("\n")}`;
-    return result;
+    
+    // Format matches into string
+    if (allMatches.length === 0) {
+      return "No matches found.";
+    }
+    
+    const lines: string[] = [`Found ${allMatches.length} match(es):\n`];
+    for (const m of allMatches) {
+      if (m.error) {
+        lines.push(`**${m.objectId}**: ${m.error}`);
+      } else {
+        lines.push(`**${m.objectId}** [offset ${m.offset}]:`);
+        lines.push(`  ...${m.context}...`);
+      }
+    }
+    
+    return lines.join("\n");
   });
 
   // rlm_query — only at depth < maxDepth
