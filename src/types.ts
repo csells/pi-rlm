@@ -97,6 +97,7 @@ export interface IExternalStore {
   initialize(): Promise<void>;
   flush(): Promise<void>;
   clear?(): Promise<void>;
+  mergeFrom(otherStoreDir: string): Promise<void>;
   rebuildExternalizedMap(): void;
   getExternalizedId(fingerprint: string): string | null;
   addExternalized(fingerprint: string, objectId: string): void;
@@ -183,6 +184,7 @@ export interface RlmConfig {
   maxChildCalls: number;
   childMaxTokens: number;
   childModel?: string;
+  previousSessionId?: string;
   retentionDays: number;
   maxIngestFiles: number;
   maxIngestBytes: number;

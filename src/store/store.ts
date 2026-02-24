@@ -215,6 +215,97 @@ export class ExternalStore {
   }
 
   /**
+   * Merge records from another session's store.
+   * Reads store.jsonl from otherStoreDir, imports records that don't already exist (dedup by record ID),
+   * updates in-memory cache and index, and writes merged records to current store's JSONL.
+   * Throws if the source directory doesn't exist.
+   */
+  async mergeFrom(otherStoreDir: string): Promise<void> {
+    const otherStorePath = path.join(otherStoreDir, "store.jsonl");
+    
+    // Check if source directory and file exist
+    try {
+      await fs.promises.stat(otherStoreDir);
+    } catch {
+      throw new Error(`Cannot merge from previous session: source directory not found: ${otherStoreDir}`);
+    }
+
+    let sourceExists = false;
+    try {
+      await fs.promises.stat(otherStorePath);
+      sourceExists = true;
+    } catch {
+      // store.jsonl doesn't exist, which is fine (empty previous session)
+    }
+
+    if (!sourceExists) {
+      // No records to merge
+      return;
+    }
+
+    // Read and parse the other store's JSONL
+    let importedCount = 0;
+    try {
+      const data = await fs.promises.readFile(otherStorePath, "utf-8");
+      const lines = data.split("\n").filter((line) => line.trim());
+
+      for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+        const line = lines[lineNum];
+        try {
+          const record: StoreRecord = JSON.parse(line);
+
+          // Skip if we already have this record ID
+          if (this.records.has(record.id)) {
+            continue;
+          }
+
+          // Import the record
+          this.records.set(record.id, record);
+
+          // Create index entry
+          const entry: StoreIndexEntry = {
+            id: record.id,
+            type: record.type,
+            description: record.description,
+            tokenEstimate: record.tokenEstimate,
+            createdAt: record.createdAt,
+            byteOffset: -1, // Will be set on flush
+            byteLength: -1, // Will be set on flush
+          };
+          this.index.objects.push(entry);
+          this.index.totalTokens += record.tokenEstimate;
+
+          importedCount++;
+
+          // Enqueue write for this record
+          void this.writeQueue.enqueue("store.merge", async () => {
+            const { byteOffset, byteLength } = await this.writeRecordToJsonl(record);
+            
+            // Update the index entry with actual byte values
+            const indexEntry = this.index.objects.find((e) => e.id === record.id);
+            if (indexEntry) {
+              indexEntry.byteOffset = byteOffset;
+              indexEntry.byteLength = byteLength;
+            }
+          });
+        } catch (parseErr) {
+          console.warn(`[pi-rlm] Failed to parse JSONL line ${lineNum + 1} from previous session, skipping:`, parseErr);
+          // Continue loading remaining lines
+        }
+      }
+    } catch (err) {
+      throw new Error(`Failed to read previous session store: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Flush all merged writes and update index
+    await this.writeQueue.enqueue("store.merge-finalize", async () => {
+      await this.writeIndex();
+    });
+
+    console.log(`[pi-rlm] Merged ${importedCount} records from previous session`);
+  }
+
+  /**
    * Rebuild the externalized messages map from store records.
    * Called on initialization (§11.2).
    */

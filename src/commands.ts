@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DEFAULT_CONFIG, mergeConfig } from "./config.js";
 import { showInspector } from "./ui/inspector.js";
+import { getRlmStoreDir } from "./store/store.js";
 import type { CallTree } from "./engine/call-tree.js";
 import type { ExtensionContext, IExternalStore, ITrajectoryLogger, RlmConfig } from "./types.js";
 
@@ -70,6 +71,9 @@ export function registerCommands(pi: any, state: RlmCommandState): void {
           return;
         case "clear":
           await clearStore(state, ctx);
+          return;
+        case "resume":
+          await resumeFromSession(pi, state, ctx, commandArgs);
           return;
         default:
           notify(ctx, "Unknown /rlm subcommand. Try /rlm for status.", "warning");
@@ -298,6 +302,65 @@ async function clearStore(state: RlmCommandState, ctx: ExtensionContext): Promis
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     notify(ctx, `Failed to clear store: ${message}`, "error");
+  }
+}
+
+async function resumeFromSession(
+  pi: any,
+  state: RlmCommandState,
+  ctx: ExtensionContext,
+  sessionIdArg: string,
+): Promise<void> {
+  const sessionId = sessionIdArg.trim();
+
+  if (!sessionId) {
+    notify(ctx, "Usage: /rlm resume <sessionId>", "warning");
+    return;
+  }
+
+  try {
+    const previousStoreDir = getRlmStoreDir(ctx.cwd, sessionId);
+
+    // Check if the source directory exists
+    try {
+      await fs.promises.stat(previousStoreDir);
+    } catch {
+      notify(
+        ctx,
+        `Cannot resume from session "${sessionId}": session not found at ${previousStoreDir}`,
+        "error",
+      );
+      return;
+    }
+
+    // Merge the records
+    const mergeFrom = (state.store as any).mergeFrom;
+    if (typeof mergeFrom !== "function") {
+      notify(ctx, "Store mergeFrom() not supported by this backend.", "warning");
+      return;
+    }
+
+    await mergeFrom.call(state.store, previousStoreDir);
+
+    // Update config to record the resume
+    state.config.previousSessionId = sessionId;
+    persistConfig(pi, state.config);
+
+    // Flush to persist the merge
+    await state.store.flush();
+
+    // Count imported objects
+    const currentIndex = state.store.getFullIndex();
+    notify(
+      ctx,
+      `Resumed from session "${sessionId}": imported ${currentIndex.objects.length} object(s). Store now has ${currentIndex.objects.length} total objects.`,
+      "success",
+    );
+
+    state.updateWidget(ctx);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    notify(ctx, `Failed to resume from session: ${message}`, "error");
   }
 }
 

@@ -187,6 +187,23 @@ export async function onSessionStart(
 
   try {
     await store.initialize();
+
+    // Merge from previous session if configured
+    if (state.config.previousSessionId) {
+      try {
+        const previousStoreDir = getRlmStoreDir(ctx.cwd, state.config.previousSessionId);
+        await store.mergeFrom(previousStoreDir);
+      } catch (mergeErr) {
+        console.warn("[pi-rlm] Failed to merge from previous session:", mergeErr);
+        if (ctx.hasUI) {
+          (ctx as any).ui?.notify?.(
+            `Failed to resume from session ${state.config.previousSessionId}: ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`,
+            "warning",
+          );
+        }
+      }
+    }
+
     state.storeHealthy = true;
   } catch (err) {
     state.storeHealthy = false;

@@ -565,4 +565,237 @@ describe("ExternalStore", () => {
       expect(entry2!.byteOffset).toBeGreaterThanOrEqual(entry1!.byteOffset + entry1!.byteLength);
     });
   });
+
+  describe("mergeFrom()", () => {
+    let sourceStoreDir: string;
+    let sourceStore: ExternalStore;
+
+    beforeEach(async () => {
+      // Create source and target stores
+      sourceStoreDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-rlm-merge-src-"));
+      sourceStore = new ExternalStore(sourceStoreDir, "source-session");
+      await sourceStore.initialize();
+      await store.initialize();
+    });
+
+    afterEach(async () => {
+      await sourceStore.flush();
+      await fs.promises.rm(sourceStoreDir, { recursive: true, force: true });
+    });
+
+    it("should import records from another session's store", async () => {
+      // Add records to source store
+      const sourceRecord = sourceStore.add({
+        type: "conversation",
+        description: "from source session",
+        tokenEstimate: 150,
+        source: { kind: "externalized", fingerprint: "fp-source-1" },
+        content: "source content",
+      });
+
+      await sourceStore.flush();
+
+      // Merge into target store
+      await store.mergeFrom(sourceStoreDir);
+      await store.flush();
+
+      // Verify the record was imported
+      const imported = store.get(sourceRecord.id);
+      expect(imported).not.toBeNull();
+      expect(imported?.description).toBe("from source session");
+      expect(imported?.content).toBe("source content");
+    });
+
+    it("should skip duplicate records during merge", async () => {
+      // Add the same record to both stores
+      const recordData = {
+        type: "conversation" as const,
+        description: "shared record",
+        tokenEstimate: 200,
+        source: { kind: "externalized" as const, fingerprint: "fp-shared" },
+        content: "shared content",
+      };
+
+      const targetRecord = store.add(recordData);
+      await store.flush();
+
+      // Manually create a record with the same ID in source
+      const sourceStorePath = path.join(sourceStoreDir, "store.jsonl");
+      const sourceRecord: StoreRecord = {
+        ...targetRecord,
+        description: "should be skipped",
+        content: "different content",
+      };
+      const line = JSON.stringify(sourceRecord) + "\n";
+      await fs.promises.writeFile(sourceStorePath, line, "utf-8");
+
+      // Create index for source
+      const sourceIndex = {
+        version: 1,
+        sessionId: "source-session",
+        objects: [
+          {
+            id: sourceRecord.id,
+            type: "conversation" as const,
+            description: sourceRecord.description,
+            tokenEstimate: sourceRecord.tokenEstimate,
+            createdAt: sourceRecord.createdAt,
+            byteOffset: 0,
+            byteLength: line.length,
+          },
+        ],
+        totalTokens: sourceRecord.tokenEstimate,
+      };
+      await fs.promises.writeFile(
+        path.join(sourceStoreDir, "index.json"),
+        JSON.stringify(sourceIndex),
+        "utf-8",
+      );
+
+      // Merge
+      await store.mergeFrom(sourceStoreDir);
+
+      // Verify the original record is unchanged
+      const retrieved = store.get(targetRecord.id);
+      expect(retrieved?.description).toBe("shared record");
+      expect(retrieved?.content).toBe("shared content");
+    });
+
+    it("should handle missing source directory with error", async () => {
+      const nonexistentDir = path.join(tmpDir, "nonexistent-session");
+
+      await expect(store.mergeFrom(nonexistentDir)).rejects.toThrow(
+        /source directory not found/,
+      );
+    });
+
+    it("should handle missing store.jsonl gracefully", async () => {
+      // Source directory exists but store.jsonl doesn't
+      const emptySourceDir = await fs.promises.mkdtemp(
+        path.join(os.tmpdir(), "pi-rlm-merge-empty-"),
+      );
+
+      try {
+        // Should not throw
+        await store.mergeFrom(emptySourceDir);
+
+        // Store should still be empty
+        expect(store.getAllIds()).toEqual([]);
+      } finally {
+        await fs.promises.rm(emptySourceDir, { recursive: true, force: true });
+      }
+    });
+
+    it("should import multiple records and update index", async () => {
+      // Add multiple records to source
+      const sourceRecord1 = sourceStore.add({
+        type: "conversation",
+        description: "first import",
+        tokenEstimate: 100,
+        source: { kind: "externalized", fingerprint: "fp-1" },
+        content: "content 1",
+      });
+
+      const sourceRecord2 = sourceStore.add({
+        type: "tool_output",
+        description: "second import",
+        tokenEstimate: 200,
+        source: { kind: "ingested", path: "/path/to/file.ts" },
+        content: "content 2",
+      });
+
+      await sourceStore.flush();
+
+      // Merge
+      await store.mergeFrom(sourceStoreDir);
+      await store.flush();
+
+      // Verify both records imported
+      expect(store.get(sourceRecord1.id)).not.toBeNull();
+      expect(store.get(sourceRecord2.id)).not.toBeNull();
+
+      // Verify index is updated
+      const index = store.getFullIndex();
+      expect(index.totalTokens).toBe(300); // 100 + 200
+      expect(index.objects.length).toBe(2);
+    });
+
+    it("should skip corrupt JSONL lines in source store", async () => {
+      // Create source store with mixed valid/corrupt lines
+      const validRecord: StoreRecord = {
+        id: "rlm-obj-valid",
+        type: "conversation",
+        description: "valid record",
+        createdAt: 123456,
+        tokenEstimate: 100,
+        source: { kind: "externalized", fingerprint: "fp-valid" },
+        content: "valid content",
+      };
+
+      const corruptLine = "this is not valid json\n";
+      const jsonlContent = JSON.stringify(validRecord) + "\n" + corruptLine;
+
+      const sourceStorePath = path.join(sourceStoreDir, "store.jsonl");
+      await fs.promises.writeFile(sourceStorePath, jsonlContent, "utf-8");
+
+      // Create source index
+      const sourceIndex = {
+        version: 1,
+        sessionId: "source-session",
+        objects: [
+          {
+            id: "rlm-obj-valid",
+            type: "conversation" as const,
+            description: "valid record",
+            tokenEstimate: 100,
+            createdAt: 123456,
+            byteOffset: 0,
+            byteLength: 100,
+          },
+        ],
+        totalTokens: 100,
+      };
+      await fs.promises.writeFile(
+        path.join(sourceStoreDir, "index.json"),
+        JSON.stringify(sourceIndex),
+        "utf-8",
+      );
+
+      // Merge should skip corrupt line and import valid record
+      const warnSpy = { called: false };
+      const originalWarn = console.warn;
+      console.warn = (msg: any) => {
+        if (String(msg).includes("Failed to parse JSONL line")) {
+          warnSpy.called = true;
+        }
+        originalWarn(msg);
+      };
+
+      try {
+        await store.mergeFrom(sourceStoreDir);
+        expect(store.get("rlm-obj-valid")).not.toBeNull();
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+
+    it("should update tokenEstimate in index during merge", async () => {
+      const sourceRecord = sourceStore.add({
+        type: "conversation",
+        description: "token test",
+        tokenEstimate: 999,
+        source: { kind: "externalized", fingerprint: "fp-tokens" },
+        content: "content",
+      });
+
+      await sourceStore.flush();
+      await store.mergeFrom(sourceStoreDir);
+      await store.flush();
+
+      const index = store.getFullIndex();
+      const indexEntry = index.objects.find((e) => e.id === sourceRecord.id);
+      expect(indexEntry?.tokenEstimate).toBe(999);
+      expect(index.totalTokens).toBe(999);
+    });
+  });
 });
