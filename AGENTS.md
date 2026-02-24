@@ -1,0 +1,54 @@
+# Pi-RLM
+
+Pi extension for Recursive Language Model context management — externalizes
+conversation context so sessions can grow beyond the context window.
+
+Build with `npm run build`. Test with `npm test`.
+
+For vision and requirements, see `specs/`.
+
+use your own sub-agents, the codex CLI and the gemini CLI to check the project
+for best practices. make recommendations based on the consolidated review
+feedback.
+
+# Architecture Best Practices
+
+- **TDD (Test-Driven Development)** - write the tests first; the implementation
+  code isn't done until the tests pass.
+- **DRY (Don’t Repeat Yourself)** – eliminate duplicated logic by extracting
+  shared utilities and modules.
+- **Separation of Concerns** – each module should handle one distinct
+  responsibility.
+- **Single Responsibility Principle (SRP)** – every class/module/function/file
+  should have exactly one reason to change.
+- **Clear Abstractions & Contracts** – expose intent through small, stable
+  interfaces and hide implementation details.
+- **Low Coupling, High Cohesion** – keep modules self-contained, minimize
+  cross-dependencies.
+- **Scalability & Statelessness** – design components to scale horizontally and
+  prefer stateless services when possible.
+- **Observability & Testability** – build in logging, metrics, tracing, and
+  ensure components can be unit/integration tested.
+- **KISS (Keep It Simple, Sir)** - keep solutions as simple as possible.
+- **YAGNI (You're Not Gonna Need It)** – avoid speculative complexity or
+  over-engineering.
+- **Don't Swallow Errors** by catching exceptions, silently filling in required
+  but missing values or adding timeouts when something hangs unexpectedly. All
+  of those are exceptions that should be thrown so that the errors can be seen,
+  root causes can be found and fixes can be applied.
+- **No Placeholder Code** - we're building production code here, not toys.
+- **No Comments for Removed Functionality** - the source is not the place to
+  keep history of what's changed; it's the place to implement the current
+  requirements only.
+- **Layered Architecture** - organize code into clear tiers where each layer
+  depends only on the one(s) below it, keeping logic cleanly separated.
+- **Prefer Non-Nullable Variables** when possible; use nullability sparingly.
+- **Prefer Async Notifications** when possible over inefficient polling.
+- **Consider First Principles** to assess your current architecture against the
+  one you'd use if you started over from scratch.
+- **Eliminate Race Conditions** that might cause dropped or corrupted data
+- **Write for Maintainability** so that the code is clear and readable and easy
+  to maintain by future developers.
+- **Arrange Project Idiomatically** for the language and framework being used,
+  including recommended lints, static analysis tools, folder structure and
+  gitignore entries.
