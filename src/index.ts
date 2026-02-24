@@ -267,7 +267,14 @@ export async function onBeforeAgentStart(
 ): Promise<{ systemPrompt: string } | undefined> {
   if (!state.enabled) return;
 
-  const rlmPrompt = buildSystemPrompt(state.config);
+  let rlmPrompt = state.config.systemPromptOverride ?? buildSystemPrompt(state.config);
+
+  // If override contains {{default}} placeholder, replace it with buildSystemPrompt output
+  if (state.config.systemPromptOverride && rlmPrompt.includes("{{default}}")) {
+    const defaultPrompt = buildSystemPrompt(state.config);
+    rlmPrompt = rlmPrompt.replace(/\{\{default\}\}/g, defaultPrompt);
+  }
+
   const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
 
   return {

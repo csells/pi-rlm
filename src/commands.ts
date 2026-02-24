@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DEFAULT_CONFIG, mergeConfig } from "./config.js";
+import { buildSystemPrompt } from "./system-prompt.js";
 import { showInspector } from "./ui/inspector.js";
 import { getRlmStoreDir } from "./store/store.js";
 import type { CallTree } from "./engine/call-tree.js";
@@ -74,6 +75,9 @@ export function registerCommands(pi: any, state: RlmCommandState): void {
           return;
         case "resume":
           await resumeFromSession(pi, state, ctx, commandArgs);
+          return;
+        case "prompt":
+          handlePromptCommand(pi, state, ctx, commandArgs);
           return;
         default:
           notify(ctx, "Unknown /rlm subcommand. Try /rlm for status.", "warning");
@@ -362,6 +366,46 @@ async function resumeFromSession(
     const message = err instanceof Error ? err.message : String(err);
     notify(ctx, `Failed to resume from session: ${message}`, "error");
   }
+}
+
+function handlePromptCommand(
+  pi: any,
+  state: RlmCommandState,
+  ctx: ExtensionContext,
+  args: string,
+): void {
+  const arg = args.trim();
+
+  if (!arg) {
+    // Show current system prompt (default or override), truncated to 500 chars
+    const currentPrompt = state.config.systemPromptOverride ?? buildSystemPrompt(state.config);
+    const truncated = currentPrompt.substring(0, 500);
+    const isTruncated = currentPrompt.length > 500;
+
+    const message = isTruncated
+      ? `Current system prompt (truncated):\n${truncated}\n\n... (${currentPrompt.length - 500} more characters)`
+      : `Current system prompt:\n${truncated}`;
+
+    notify(ctx, message, "info");
+    return;
+  }
+
+  if (arg.toLowerCase() === "reset") {
+    // Clear systemPromptOverride
+    state.config.systemPromptOverride = undefined;
+    persistConfig(pi, state.config);
+    notify(ctx, "System prompt reset to default.", "success");
+    return;
+  }
+
+  // Set systemPromptOverride to the provided text
+  state.config.systemPromptOverride = arg;
+  persistConfig(pi, state.config);
+  notify(
+    ctx,
+    `System prompt override set. Use /rlm prompt reset to revert to default.`,
+    "success",
+  );
 }
 
 function showStatus(state: RlmCommandState, ctx: ExtensionContext): void {

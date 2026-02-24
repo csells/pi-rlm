@@ -185,6 +185,7 @@ export interface RlmConfig {
   childMaxTokens: number;
   childModel?: string;
   previousSessionId?: string;
+  systemPromptOverride?: string;
   retentionDays: number;
   maxIngestFiles: number;
   maxIngestBytes: number;
