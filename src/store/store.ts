@@ -27,6 +27,7 @@ export class ExternalStore {
   private index: StoreIndex;
   private writeQueue: WriteQueue;
   private externalizedMap: Map<string, string> = new Map(); // fingerprint → object ID
+  private nextByteOffset: number = 0; // Track current byte position in JSONL file
 
   constructor(storeDir: string, sessionId: string) {
     this.storeDir = storeDir;
@@ -59,21 +60,33 @@ export class ExternalStore {
         if (loadedIndex.version === 1) {
           this.index = loadedIndex;
 
-          // Load all records from JSONL
+          // Load all records from JSONL with crash recovery
           try {
             const data = await fs.promises.readFile(storePath, "utf-8");
             const lines = data.split("\n").filter((line) => line.trim());
-            for (const line of lines) {
-              const record: StoreRecord = JSON.parse(line);
-              this.records.set(record.id, record);
+            for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+              const line = lines[lineNum];
+              try {
+                const record: StoreRecord = JSON.parse(line);
+                this.records.set(record.id, record);
+              } catch (parseErr) {
+                console.warn(`[pi-rlm] Failed to parse JSONL line ${lineNum + 1}, skipping:`, parseErr);
+                // Continue loading remaining lines
+              }
             }
+            
+            // Set nextByteOffset to the file size
+            const stat = await fs.promises.stat(storePath);
+            this.nextByteOffset = stat.size;
           } catch (err) {
             console.warn("[pi-rlm] Could not load store.jsonl, rebuilding from index", err);
             // Fall back to empty (will rebuild on next write)
+            this.nextByteOffset = 0;
           }
         }
       } catch (err) {
         console.log("[pi-rlm] No existing store index, creating new store");
+        this.nextByteOffset = 0;
       }
 
       this.rebuildExternalizedMap();
@@ -110,15 +123,15 @@ export class ExternalStore {
     // Update in-memory cache
     this.records.set(id, record);
 
-    // Update index
+    // Update index - set initial byteOffset/byteLength to -1
     const entry: StoreIndexEntry = {
       id: record.id,
       type: record.type,
       description: record.description,
       tokenEstimate: record.tokenEstimate,
       createdAt: record.createdAt,
-      byteOffset: 0, // Will be calculated on write
-      byteLength: 0, // Will be calculated on write
+      byteOffset: -1, // Will be set on write completion
+      byteLength: -1, // Will be set on write completion
     };
 
     this.index.objects.push(entry);
@@ -126,7 +139,15 @@ export class ExternalStore {
 
     // Enqueue write
     void this.writeQueue.enqueue("store.add", async () => {
-      await this.writeRecordToJsonl(record);
+      const { byteOffset, byteLength } = await this.writeRecordToJsonl(record);
+      
+      // Update the index entry with actual byte values
+      const indexEntry = this.index.objects.find((e) => e.id === record.id);
+      if (indexEntry) {
+        indexEntry.byteOffset = byteOffset;
+        indexEntry.byteLength = byteLength;
+      }
+      
       await this.writeIndex();
     });
 
@@ -221,14 +242,27 @@ export class ExternalStore {
   }
 
   /**
-   * Private: Write a record to the JSONL file.
+   * Private: Write a record to the JSONL file and track byte offsets.
    */
-  private async writeRecordToJsonl(record: StoreRecord): Promise<void> {
+  private async writeRecordToJsonl(
+    record: StoreRecord
+  ): Promise<{ byteOffset: number; byteLength: number }> {
     const storePath = path.join(this.storeDir, "store.jsonl");
     const line = JSON.stringify(record) + "\n";
+    
+    // Capture current offset before writing
+    const byteOffset = this.nextByteOffset;
+    
+    // Compute byte length from the serialized line
+    const byteLength = Buffer.byteLength(line, "utf-8");
 
     try {
       await fs.promises.appendFile(storePath, line, "utf-8");
+      
+      // Update nextByteOffset after successful write
+      this.nextByteOffset += byteLength;
+      
+      return { byteOffset, byteLength };
     } catch (err) {
       console.error("[pi-rlm] Failed to write to store.jsonl:", err);
       throw err;

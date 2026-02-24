@@ -390,4 +390,179 @@ describe("ExternalStore", () => {
       expect(found).toBe("obj-2");
     });
   });
+
+  describe("Crash recovery in initialize()", () => {
+    it("should skip corrupt JSONL lines and load valid ones", async () => {
+      const storeDir = path.join(tmpDir, "crash-recovery-store");
+      await fs.promises.mkdir(storeDir, { recursive: true });
+
+      // Create a JSONL file with a corrupt line in the middle
+      const validRecord1: StoreRecord = {
+        id: "rlm-obj-valid-1",
+        type: "conversation",
+        description: "first valid",
+        createdAt: 123456,
+        tokenEstimate: 100,
+        source: { kind: "externalized", fingerprint: "fp-1" },
+        content: "valid content 1",
+      };
+
+      const validRecord2: StoreRecord = {
+        id: "rlm-obj-valid-2",
+        type: "conversation",
+        description: "second valid",
+        createdAt: 123457,
+        tokenEstimate: 200,
+        source: { kind: "externalized", fingerprint: "fp-2" },
+        content: "valid content 2",
+      };
+
+      const corruptLine = "this is not valid json\n";
+
+      const jsonlContent =
+        JSON.stringify(validRecord1) +
+        "\n" +
+        corruptLine +
+        JSON.stringify(validRecord2) +
+        "\n";
+
+      await fs.promises.writeFile(path.join(storeDir, "store.jsonl"), jsonlContent, "utf-8");
+
+      // Create index
+      const index = {
+        version: 1,
+        sessionId: "crash-recovery-test",
+        objects: [
+          {
+            id: "rlm-obj-valid-1",
+            type: "conversation" as const,
+            description: "first valid",
+            tokenEstimate: 100,
+            createdAt: 123456,
+            byteOffset: 0,
+            byteLength: 100,
+          },
+          {
+            id: "rlm-obj-valid-2",
+            type: "conversation" as const,
+            description: "second valid",
+            tokenEstimate: 200,
+            createdAt: 123457,
+            byteOffset: 150,
+            byteLength: 100,
+          },
+        ],
+        totalTokens: 300,
+      };
+      await fs.promises.writeFile(path.join(storeDir, "index.json"), JSON.stringify(index), "utf-8");
+
+      const newStore = new ExternalStore(storeDir, "crash-recovery-test");
+      
+      // Capture console.warn calls
+      const warnSpy = { called: false, message: "" };
+      const originalWarn = console.warn;
+      console.warn = (msg: any) => {
+        if (String(msg).includes("Failed to parse JSONL line")) {
+          warnSpy.called = true;
+          warnSpy.message = String(msg);
+        }
+        originalWarn(msg);
+      };
+
+      try {
+        await newStore.initialize();
+
+        // Should have loaded both valid records and skipped the corrupt one
+        expect(newStore.get("rlm-obj-valid-1")).not.toBeNull();
+        expect(newStore.get("rlm-obj-valid-2")).not.toBeNull();
+        
+        // Should have warned about the corrupt line
+        expect(warnSpy.called).toBe(true);
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+  });
+
+  describe("byteOffset/byteLength tracking", () => {
+    beforeEach(async () => {
+      await store.initialize();
+    });
+
+    it("should set byteOffset/byteLength to -1 before flush completes", () => {
+      const record = store.add({
+        type: "conversation",
+        description: "test",
+        tokenEstimate: 100,
+        source: { kind: "externalized", fingerprint: "fp-1" },
+        content: "test content",
+      });
+
+      // Before flush, the index entry should have -1 for both
+      const indexEntry = store.getIndexEntry(record.id);
+      expect(indexEntry).not.toBeNull();
+      expect(indexEntry?.byteOffset).toBe(-1);
+      expect(indexEntry?.byteLength).toBe(-1);
+    });
+
+    it("should set correct byteOffset/byteLength after add() + flush()", async () => {
+      const record = store.add({
+        type: "conversation",
+        description: "test record",
+        tokenEstimate: 250,
+        source: { kind: "externalized", fingerprint: "fp-test" },
+        content: "this is test content",
+      });
+
+      // Flush to ensure the write completes
+      await store.flush();
+
+      // After flush, the index entry should have valid byte values
+      const indexEntry = store.getIndexEntry(record.id);
+      expect(indexEntry).not.toBeNull();
+      expect(indexEntry?.byteOffset).toBeGreaterThanOrEqual(0);
+      expect(indexEntry?.byteLength).toBeGreaterThan(0);
+
+      // The byte offset and length should reflect the actual file position
+      const storePath = path.join(tmpDir, "store.jsonl");
+      const fileData = await fs.promises.readFile(storePath, "utf-8");
+      const recordLine = JSON.stringify(record) + "\n";
+      expect(fileData.includes(recordLine)).toBe(true);
+    });
+
+    it("should track multiple records with correct offsets", async () => {
+      const record1 = store.add({
+        type: "conversation",
+        description: "first",
+        tokenEstimate: 100,
+        source: { kind: "externalized", fingerprint: "fp-1" },
+        content: "content one",
+      });
+
+      const record2 = store.add({
+        type: "conversation",
+        description: "second",
+        tokenEstimate: 200,
+        source: { kind: "externalized", fingerprint: "fp-2" },
+        content: "content two with more text",
+      });
+
+      await store.flush();
+
+      const entry1 = store.getIndexEntry(record1.id);
+      const entry2 = store.getIndexEntry(record2.id);
+
+      expect(entry1).not.toBeNull();
+      expect(entry2).not.toBeNull();
+
+      // Both should have valid offsets and lengths
+      expect(entry1!.byteOffset).toBeGreaterThanOrEqual(0);
+      expect(entry1!.byteLength).toBeGreaterThan(0);
+      expect(entry2!.byteOffset).toBeGreaterThanOrEqual(0);
+      expect(entry2!.byteLength).toBeGreaterThan(0);
+
+      // Second record offset should be after the first
+      expect(entry2!.byteOffset).toBeGreaterThanOrEqual(entry1!.byteOffset + entry1!.byteLength);
+    });
+  });
 });
